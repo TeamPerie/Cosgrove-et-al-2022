@@ -1,0 +1,720 @@
+---
+title: "MPP_transplantation_expt"
+author: "Jason Cosgrove"
+date: '2022-07-20'
+output: html_document
+---
+
+
+
+# Analysis of clone size, diversity in fate of barcoded MPPs
+
+In this experiment we sorted MPPs from WT mice (mice were sent from IMDEA madrid) and barcoded them with the LG2.2 library. Cells were transplanted into irradiated recipients and 3 weeks later the bone marrow was harvested, barcoded cells were sorted and lysed for barcode library sequencing. 
+
+
+
+### Step 1: Set up the workspace
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Wet_lab/JCW24_G6PD_barcoding/LentiviralBarcoding_Analysis/inputs/")
+
+#clear the workspace and load in the necessary packages
+rm(list = ls())
+library(cowplot)
+library(plotrix)
+library(ggplot2)
+library(dplyr)
+
+
+setwd("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Wet_lab/JCW24_G6PD_barcoding/LentiviralBarcoding_Analysis/inputs/")
+
+#load int he cell couunts that we will use later on for normalisation
+cell_counts <- read.csv('/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Wet_lab/JCW24_G6PD_barcoding/LentiviralBarcoding_Analysis/cell_counts.csv')
+
+
+```
+
+
+```{r helper_methods, echo=FALSE}
+
+columnNormalisation <- function(data,barcodes){
+ 
+   data.normed <- apply(data,2, function(x) (x/sum(x))) # here we normalise for each sample
+   rownames(data.normed) <- barcodes
+   return(data.normed)
+
+}
+
+removeUninformativeClones <- function(mat){
+      #remove any rows where both pos and neg are zero
+    m.filtered <- mat[rowSums(mat)> 0,]
+    return(m.filtered)
+}
+
+getMouseMatrix <- function(mat, mouse.id){
+    
+   mouse.columns <- colnames(mat)[grepl(mouse.id,colnames(mat))]
+   mouse <- data.frame(mat[,c(mouse.columns)])
+   m <- removeUninformativeClones(mouse)
+   colnames(m) <- c("cd62lhi","cd62lneg","B","M","E")
+    return(m)
+}
+
+
+
+cellcountNormalisation <- function(mouse, mouse.mat){
+
+    mat.cellnorm <- mouse.mat
+    
+    mat.cellnorm[,1] <- mouse.mat[,1] * cell_counts[cell_counts$Mouse == mouse  & cell_counts$Gate == 'cd62l-high',6]
+    mat.cellnorm[,2] <- mouse.mat[,2] * cell_counts[cell_counts$Mouse == mouse & cell_counts$Gate == 'cd62l-neg',6]
+    mat.cellnorm[,3] <- mouse.mat[,3] * cell_counts[cell_counts$Mouse == mouse  & cell_counts$Gate == 'B',6]
+    mat.cellnorm[,4] <- mouse.mat[,4] * cell_counts[cell_counts$Mouse == mouse  & cell_counts$Gate == 'M',6]
+    mat.cellnorm[,5] <- mouse.mat[,5] * cell_counts[cell_counts$Mouse == mouse  & cell_counts$Gate == 'E',6]
+    
+    colnames(mat.cellnorm) <- c("cd62lhi","cd62lneg","B","M","E")
+    return(mat.cellnorm)
+
+}
+
+
+makeMetaMouse <- function(m1,m2,m3,m4){
+
+  
+  #rename columns so they are consistent across datasets
+  colnames(m1) <- c("cd62lhi","cd62lneg","B","M","E")
+  colnames(m2) <- c("cd62lhi","cd62lneg","B","M","E")
+  colnames(m3) <- c("cd62lhi","cd62lneg","B","M","E")
+  colnames(m4) <- c("cd62lhi","cd62lneg","B","M","E")
+  
+  #now make an integrated sample with all mice
+  supermouse <- rbind(m1, m2,m3,m4)
+  
+  #clones must be in either the pos or the neg
+  supermouse <- supermouse[rowSums(supermouse) > 0,]
+  
+  return(supermouse)
+}
+
+# set a new parameter bias stating whether its a cd62lpos or cd62l neg clone. Cells with non zero expression in both samples are considered unbiased
+setCloneBias <- function(supermouse,threshold1, threshold2){
+  supermouse$bias <- rep('None',nrow(supermouse))
+  supermouse$bias[which(supermouse$cd62lhi <= threshold1 & supermouse$cd62lneg > threshold2)] <- "cd62lneg"
+  supermouse$bias[which(supermouse$cd62lneg <= threshold1 & supermouse$cd62lhi > threshold2)] <- "cd62lhi"
+  return(supermouse)
+}
+
+
+
+#perform row level normalisation to compute bias
+performRowNormalisation <- function(matrix){
+  for(i in 1:nrow(matrix)){
+      if(rowSums(matrix[i,c("B","M","E")]) > 0){
+              matrix[i,c("B","M","E")] <-   
+                matrix[i,c("B","M","E")]/sum(matrix[i,c("B","M","E")])
+       }
+     }
+  return(matrix)
+}
+
+
+generateCumulativeProbabilityNorm <- function(barcodematrix,sample){
+  
+  #renormalise the clones to 1 for the myeloid lineage
+  barcodematrix$data.normalised <- barcodematrix[,sample] / sum(barcodematrix[,sample])
+
+  #rank each clone in terms of normalised abundance
+  data.ranked <- barcodematrix[order(barcodematrix$data.normalised),]
+  
+  output <- data.frame(cbind((data.ranked[,sample]),
+                             cumsum(data.ranked$data.normalised)))
+  colnames(output) <- c("cell_counts","cumsum")
+  rownames(output) <- rownames(data.ranked)
+  return(output)
+  
+}
+
+
+plotDiversity <- function(df){
+  barplot(c(nrow(df[df$cd62lneg > 0,]),
+  nrow(df[df$cd62lhi > 0,])), main = "barcode diversity in the myeloid lineage",ylab = "number of barcodes in M",names = c("cd62Lneg","cd62Lhigh"))
+}
+
+
+plotClassifier <- function(mouse){
+qplot(asinh(mouse$cd62lneg) ,asinh(mouse$cd62lhi),col = mouse$bias) + geom_abline(intercept = 0,slope = 1, col = 'grey30') + scale_color_manual(values=c("blue", "red","grey60"))   +  geom_point(size=3) + theme(panel.background = element_blank())
+}
+
+
+cloneSizeDistribution <- function(df.cellnorm,
+                                  cd62lneg.barcodes,cd62lhi.barcodes,lin){
+
+  
+  df.cellnorm.subset <- df.cellnorm[c(cd62lneg.barcodes,cd62lhi.barcodes),]
+  df.cellnorm.subset$bias <- "None"
+  df.cellnorm.subset[cd62lneg.barcodes,]$bias <- "neg"
+  df.cellnorm.subset[cd62lhi.barcodes,]$bias <- "hi"
+  df.cellnorm.subset$bias <- factor(df.cellnorm.subset$bias, levels = c("neg","hi"))
+  
+  p <- ggplot(df.cellnorm.subset,aes_string(x = 'bias', y = lin), color = c("black","blue")) + geom_boxplot(lwd = 1.3) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black")) + geom_jitter(dotsize = 0.5)
+    
+   return(p)
+
+}
+
+
+lineageBias <- function(supermouse,lin){
+
+  supermouse.rownorm<- performRowNormalisation(supermouse)
+  
+  
+  filtered <- supermouse.rownorm[supermouse.rownorm$bias == "cd62lneg" | supermouse.rownorm$bias == "cd62lhi",c("E","M","B","bias")]
+  
+  filtered$bias <- factor(filtered$bias, levels = c("cd62lneg","cd62lhi"))
+  
+  p <- ggplot(filtered,aes_string(x = 'bias', y = lin)) + geom_boxplot(lwd = 1.3) + geom_jitter(dotsize = 0.5)
+  return(p)
+
+}
+
+
+```
+
+### Step 2: Load the data
+```{r load_data}
+
+
+#load in the QC'd data matrix. 
+wt.mat <- read.csv("JCW24WT_ANALYSIS_matx_norm_filt_cor_ab_trueFalseRU.csv")
+
+#perform column-level normalisation to each sample
+wt.mat.norm <- columnNormalisation(wt.mat[,-1],wt.mat$tag)
+
+#remove barcodes that are not expressed in any of the samples
+wt.mat.norm.filt <- removeUninformativeClones(wt.mat.norm)
+
+write.csv(wt.mat.norm.filt,"/Users/jasoncosgrove/Desktop/S5.csv")
+```
+
+
+### Step 3: Make a count matrix for each mouse
+
+```{r count_matrix_each_mouse}
+
+#obtain the matrices for each mouse
+wt.m1<- getMouseMatrix(wt.mat.norm.filt,"M1.WT")
+wt.m2<- getMouseMatrix(wt.mat.norm.filt,"M2.WT")
+wt.m3<- getMouseMatrix(wt.mat.norm.filt,"M3.WT")
+wt.m4<- getMouseMatrix(wt.mat.norm.filt,"M4.WT")
+
+#normalise the values to cellcounts
+m1.wt.cellnorm <- cellcountNormalisation("M1-WT", wt.m1)
+m2.wt.cellnorm <- cellcountNormalisation("M2-WT", wt.m2)
+m3.wt.cellnorm <- cellcountNormalisation("M3-WT", wt.m3)
+m4.wt.cellnorm <- cellcountNormalisation("M4-WT", wt.m4)
+
+# merge the different mice into a single sample
+wt.meta <- makeMetaMouse(wt.m1, wt.m2, wt.m3, wt.m4 )
+
+tiff("/Users/jasoncosgrove/Desktop/barcode_diversity.tiff",
+     width =6, height = 4, units = 'in', res = 300)
+barplot(c(nrow(wt.meta[wt.meta$M > 0,]),
+          nrow(wt.meta[wt.meta$B > 0,]),
+          nrow(wt.meta[wt.meta$E > 0,]),
+          nrow(wt.meta[wt.meta$cd62lhi > 0,]),
+          nrow(wt.meta[wt.meta$cd62lneg > 0,])),
+        names = c("M","B","E","cd62lhi","cd62lneg"),ylab = "number of barcodes")
+
+dev.off()
+
+
+tiff("/Users/jasoncosgrove/Desktop/barcode_diversity.tiff",
+     width =8, height = 6, units = 'in', res = 300)
+barplot(c(nrow(wt.meta[wt.meta$M > 0 & wt.meta$cd62lneg > 0,]),
+          nrow(wt.meta[wt.meta$B > 0 & wt.meta$cd62lneg > 0,]),
+          nrow(wt.meta[wt.meta$E > 0 & wt.meta$cd62lneg > 0,]),
+          nrow(wt.meta[wt.meta$M > 0 & wt.meta$cd62lhi > 0,]),
+          nrow(wt.meta[wt.meta$B > 0 & wt.meta$cd62lhi > 0,]),
+          nrow(wt.meta[wt.meta$E > 0 & wt.meta$cd62lhi > 0,])),
+        names = c("cd62lneg-M","cd62lneg-B","cd62lneg-E","cd62lhi-M","cd62lhi-B","cd62lhi-E"),ylab = "number of barcodes found across sample pairs",ylim = c(0,500))
+dev.off()
+
+
+# merge the different mice into a single sample
+wt.meta.cellnorm <- makeMetaMouse(m1.wt.cellnorm,m2.wt.cellnorm ,m3.wt.cellnorm ,m4.wt.cellnorm )
+
+```
+
+
+
+### Step 3: Subset on barcodes that are only in CD62Lneg and CD62Lhi
+
+In this section we set a read threshold for barcode classification. This allows us to see which barcodes are found in both CD62Lneg and CD62Lhi and which is found in only one of these classes. 
+
+If we dont set a strict threshold we can get much higher number of barcodes, however a large proportion of the barcodes are very lowly expressed and so we have much less confidence that the barcodes are truly restricted to one of the CD62L subsets as sampling biases play a much larger role in lowly abundant clones. 
+
+```{r cd62l_analysis, echo=FALSE}
+tiff("/Users/jasoncosgrove/Desktop/read_thresholdhi.tiff",
+     width =5, height = 5, units = 'in', res = 300)
+wt.cumsum <- generateCumulativeProbabilityNorm(wt.meta,"cd62lhi")
+plot(1:nrow(wt.cumsum)/nrow(wt.cumsum),wt.cumsum$cumsum,col = "blue",lwd = 1,xlab = "% of all clones", ylab = "cumulative cellular output",cex  = 0.5)
+abline(h = 0.005, lwd = 2, col = "red")
+dev.off()
+
+
+tiff("/Users/jasoncosgrove/Desktop/read_thresholdneg.tiff",
+     width =5, height = 5, units = 'in', res = 300)
+wt.cumsum <- generateCumulativeProbabilityNorm(wt.meta,"cd62lneg")
+plot(1:nrow(wt.cumsum)/nrow(wt.cumsum),wt.cumsum$cumsum,col = "blue",lwd = 1,xlab = "% of all clones", ylab = "cumulative cellular output",cex  = 0.5)
+abline(h = 0.005, lwd = 2, col = "red")
+dev.off()
+
+#we have a lot of low abundance barcodes in progenitors
+plot(wt.meta$cd62lhi)
+abline(h = 0.005, lwd = 2, col = "red")
+plot(wt.meta$cd62lneg)
+abline(h = 0.005, lwd = 2, col = "red")
+
+#keep only the barcodes which are well expressed in progneitors
+mpp.only <- wt.meta[wt.meta$cd62lhi > 0.005 | wt.meta$cd62lneg > 0.005,]
+plot(mpp.only$cd62lhi)
+plot(mpp.only$cd62lneg)
+
+
+setCloneBias2 <- function(supermouse,threshold1 = 0.9){
+  
+  
+  b <- supermouse$cd62lhi/ (supermouse$cd62lhi + supermouse$cd62lneg)
+  supermouse$bias <- rep('None',nrow(supermouse))
+  supermouse$bias[which(b >= threshold1)] <- "cd62lhi"
+  supermouse$bias[which(b <= (1 - threshold1))] <- "cd62lneg"
+  return(supermouse)
+}
+
+supermouse <- setCloneBias2(mpp.only,threshold1= 0.95)
+table(supermouse$bias)
+
+
+nrow(mpp.only[mpp.only$cd62lhi > 0 & mpp.only$cd62lneg > 0,]) /
+  nrow(mpp.only[mpp.only$cd62lhi > 0 | mpp.only$cd62lneg > 0,])
+
+tiff("/Users/jasoncosgrove/Desktop/classifier.tiff",
+     width =5, height = 4, units = 'in', res = 300)
+ggplot(supermouse,aes(x = asinh(cd62lneg),y =asinh(cd62lhi), color = bias)) + geom_point(size=2) + scale_color_manual(values=c('blue','grey30', 'grey80')) +theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line(colour = "black"))
+dev.off()
+
+
+
+```
+
+
+### Step 4: diversity, clone size and bias analysis
+```{r visualise_bias_barcodes, echo=FALSE}
+
+
+mean(c( nrow(wt.m1[wt.m1$cd62lhi > 0 & wt.m1$cd62lneg >0,])/
+nrow(wt.m1[wt.m1$cd62lhi > 0 | wt.m1$cd62lneg >0,]),
+
+nrow(wt.m4[wt.m2$cd62lhi > 0 & wt.m2$cd62lneg >0,])/
+nrow(wt.m4[wt.m2$cd62lhi > 0 | wt.m2$cd62lneg >0,]),
+
+nrow(wt.m4[wt.m3$cd62lhi > 0 & wt.m3$cd62lneg >0,])/
+nrow(wt.m4[wt.m3$cd62lhi > 0 | wt.m3$cd62lneg >0,]),
+
+nrow(wt.m4[wt.m4$cd62lhi > 0 & wt.m4$cd62lneg >0,])/
+nrow(wt.m4[wt.m4$cd62lhi > 0 | wt.m4$cd62lneg >0,])))
+
+sd(c( nrow(wt.m1[wt.m1$cd62lhi > 0 & wt.m1$cd62lneg >0,])/
+nrow(wt.m1[wt.m1$cd62lhi > 0 | wt.m1$cd62lneg >0,]),
+
+nrow(wt.m4[wt.m2$cd62lhi > 0 & wt.m2$cd62lneg >0,])/
+nrow(wt.m4[wt.m2$cd62lhi > 0 | wt.m2$cd62lneg >0,]),
+
+nrow(wt.m4[wt.m3$cd62lhi > 0 & wt.m3$cd62lneg >0,])/
+nrow(wt.m4[wt.m3$cd62lhi > 0 | wt.m3$cd62lneg >0,]),
+
+nrow(wt.m4[wt.m4$cd62lhi > 0 & wt.m4$cd62lneg >0,])/
+nrow(wt.m4[wt.m4$cd62lhi > 0 | wt.m4$cd62lneg >0,])))
+
+
+prog1 <- "cd62lhi"
+prog2 <- "cd62lneg"
+lin <- "M"
+
+df <- wt.m1
+df.filter <- df[df[,prog1] > 0.005 |df[,prog2] > 0.005 ,]
+print(c(nrow(df.filter[df.filter[,prog] > 0 & df.filter[,lin] >0,])))
+
+df <- wt.m2
+df.filter <- df[df[,prog1] > 0.005 |df[,prog2] > 0.005 ,]
+print(c(nrow(df.filter[df.filter[,prog] > 0 & df.filter[,lin] >0,])))
+
+df <- wt.m3
+df.filter <- df[df[,prog1] > 0.005 |df[,prog2] > 0.005 ,]
+print(c(nrow(df.filter[df.filter[,prog] > 0 & df.filter[,lin] >0,])))
+
+df <- wt.m4
+df.filter <- df[df[,prog1] > 0.005 |df[,prog2] > 0.005 ,]
+print(c(nrow(df.filter[df.filter[,prog] > 0 & df.filter[,lin] >0,])))
+
+
+
+#subset the different clones based on their bias state
+supermouse.hi<- supermouse[supermouse$bias == "cd62lhi",]
+supermouse.neg <- supermouse[supermouse$bias == "cd62lneg",]
+supermouse.not_shared <- supermouse[supermouse$bias != "None",]
+
+cd62lhi.barcodes <- rownames(supermouse.hi)
+cd62lneg.barcodes <- rownames(supermouse.neg)
+
+#heatmap visualisation of the biased clones
+
+tiff("/Users/jasoncosgrove/Desktop/heatmap.tiff",
+     width =3, height = 4, units = 'in', res = 300)
+heatmap(asinh(as.matrix(supermouse.not_shared[,c(1:5)] )),cexRow = 0.1,cexCol = 0.8, col=colorRampPalette(c("black","green","red"),bias = 2)(300),scale = "none",distfun = function(x) dist(x,method = 'euclidean'))
+dev.off()
+
+#analysis 1 barcode diversity in M
+
+m.only <- supermouse[supermouse$M > 0,]
+
+plotDiversity(m.only)
+
+
+
+
+
+m.cs <- cloneSizeDistribution(wt.meta.cellnorm,cd62lneg.barcodes,cd62lhi.barcodes,"M")
+e.cs <- cloneSizeDistribution(wt.meta.cellnorm,cd62lneg.barcodes,cd62lhi.barcodes,"E")
+b.cs <- cloneSizeDistribution(wt.meta.cellnorm,cd62lneg.barcodes,cd62lhi.barcodes,"B")
+
+
+write.csv(m.cs$data,"/Users/jasoncosgrove/Desktop/m_cs.csv")
+write.csv(e.cs$data,"/Users/jasoncosgrove/Desktop/e_cs.csv")
+write.csv(b.cs$data,"/Users/jasoncosgrove/Desktop/b_cs.csv")
+#analysis 3 barcode lineage bias
+
+#so previosuly we normalise by column which gives us the fractional representation per lineage, a normalisation that can adjust for the different sizes of the mature compartments. Now we normalise within each clone (row normalisation). SO here you are asking per clone if i contribute to 10% of all E clones, 10% of all B clones and 20% M, then you would have a bias score of 0.25,0.25 and 0.5 for E,B, and M. 
+
+m.lb <- lineageBias(supermouse,"M")
+e.lb <- lineageBias(supermouse,"E")
+b.lb <- lineageBias(supermouse,"B")
+
+
+write.csv(m.lb$data,"/Users/jasoncosgrove/Desktop/m_lb.csv")
+write.csv(e.lb$data,"/Users/jasoncosgrove/Desktop/e_lb.csv")
+write.csv(b.lb$data,"/Users/jasoncosgrove/Desktop/b_lb.csv")
+
+```
+
+
+
+
+### Step 5: lets make the threshold stricter to make sure our results are robust
+```{r visualise_bias_barcodes2, echo=FALSE}
+
+#use a strict threshold
+supermouse <- setCloneBias2(mpp.only,threshold1 = 0.99, threshold2 = 0.01)
+
+#visualise the distribution of the biased clones
+table(supermouse$bias)
+plotClassifier(supermouse)
+
+
+#subset the different clones based on their bias state
+supermouse.hi<- supermouse[supermouse$bias == "cd62lhi",]
+supermouse.neg <- supermouse[supermouse$bias == "cd62lneg",]
+supermouse.not_shared <- supermouse[supermouse$bias != "None",]
+
+cd62lhi.barcodes <- rownames(supermouse.hi)
+cd62lneg.barcodes <- rownames(supermouse.neg)
+
+#heatmap visualisation of the biased clones
+heatmap(log(as.matrix(supermouse.not_shared[,c(1,2,4)] + 1)) ,col=colorRampPalette(c("black","green","red"),bias = 2)(300),scale = "none",distfun = function(x) dist(x,method = 'euclidean'))
+
+
+#analysis 1 barcode diversity in M
+
+m.only <- supermouse[supermouse$M > 0,]
+
+plotDiversity(m.only)
+
+#analysis 2 clone size distributions, normalised to cell counts
+
+cloneSizeDistribution(wt.meta.cellnorm,cd62lneg.barcodes,cd62lhi.barcodes)
+
+
+
+#analysis 3 barcode lineage bias
+
+#so previosuly we normalise by column which gives us the fractional representation per lineage, a normalisation that can adjust for the different sizes of the mature compartments. Now we normalise within each clone (row normalisation). SO here you are asking per clone if i contribute to 10% of all E clones, 10% of all B clones and 20% M, then you would have a bias score of 0.25,0.25 and 0.5 for E,B, and M. 
+
+lineageBias(supermouse)
+
+
+```
+
+
+
+### Step 4: Focus on myeloid producing barcodes
+
+In the G6PD analysis we set a cumulative read threshold to assign B-cell producing barcodes - lets try a similar approach here to see if our results are robust
+
+```{r threshold_analysis, echo=FALSE}
+
+
+# plot the cumulative read distribution of barcodes in Myeloid lineage
+wt.cumsum <- generateCumulativeProbabilityNorm(wt.meta,"M")
+plot(1:nrow(wt.cumsum)/nrow(wt.cumsum),wt.cumsum$cumsum,col = "blue",lwd = 1,xlab = "% of all clones", ylab = "cumulative cellular output")
+abline(h = 0.01, col = 'red')
+
+#keep the barcodes that contribute to 99% of all myeloid barcode read counts
+# in the G6PD analysis we set this to 0.95 but here we have fewer barcodes as we have 4 less mice
+myeloid.barcodes <- wt.cumsum %>% filter(cumsum > 0.05)
+
+#keep the same read thresholds as before for consistency
+supermouse <- setCloneBias(mpp.only[rownames(myeloid.barcodes),],threshold1 = 0.001, threshold2 = 0.005)
+table(supermouse$bias)
+
+
+#visualise the distribution of the biased clones
+qplot(asinh(supermouse$cd62lneg) ,asinh(supermouse$cd62lhi),col = supermouse$bias) + geom_abline(intercept = 0,slope = 1, col = 'grey30') + scale_color_manual(values=c("blue", "red","grey60"))   +  geom_point(size=2)
+
+
+#subset the different clones based on their bias state
+supermouse.hi<- supermouse[supermouse$bias == "cd62lhi",]
+supermouse.neg <- supermouse[supermouse$bias == "cd62lneg",]
+supermouse.not_shared <- supermouse[supermouse$bias != "None",]
+
+cd62lhi.barcodes <- rownames(supermouse.hi)
+cd62lneg.barcodes <- rownames(supermouse.neg)
+
+#heatmap visualisation of the biased clones
+heatmap(log(as.matrix(supermouse.not_shared[,c(1,2,4)] + 1)) ,col=colorRampPalette(c("black","green","red"),bias = 2)(300),scale = "none",distfun = function(x) dist(x,method = 'euclidean'))
+
+
+#analysis 1 barcode diversity in M
+
+m.only <- supermouse[supermouse$M > 0,]
+
+plotDiversity(m.only)
+
+
+
+#analysis 2 clone size distributions, normalised to cell counts
+
+
+cloneSizeDistribution(wt.meta.cellnorm,cd62lneg.barcodes,cd62lhi.barcodes)
+
+
+
+#analysis 3 barcode lineage bias
+
+#so previosuly we normalise by column which gives us the fractional representation per lineage, a normalisation that can adjust for the different sizes of the mature compartments. Now we normalise within each clone (row normalisation). SO here you are asking per clone if i contribute to 10% of all E clones, 10% of all B clones and 20% M, then you would have a bias score of 0.25,0.25 and 0.5 for E,B, and M. 
+lineageBias(supermouse)
+
+
+```
+
+
+
+
+### Step 5: Assess variation of results between mice
+
+Because our previous analyses were performed by pooling all of the data together to increase statistical power we lose information about how well our phenotype is maintained across biological replicates. To assess this factor we perform the same analyses as above but for each mouse. 
+
+Here we see that in mouse 2
+
+```{r individuals_m1, echo=FALSE}
+
+wt.m1<- getMouseMatrix(wt.mat.norm.filt,"M1.WT")
+wt.m2<- getMouseMatrix(wt.mat.norm.filt,"M2.WT")
+wt.m3<- getMouseMatrix(wt.mat.norm.filt,"M3.WT")
+wt.m4<- getMouseMatrix(wt.mat.norm.filt,"M4.WT")
+
+#normalise the values to cellcounts
+m1.wt.cellnorm <- cellcountNormalisation("M1-WT", wt.m1)
+m2.wt.cellnorm <- cellcountNormalisation("M2-WT", wt.m2)
+m3.wt.cellnorm <- cellcountNormalisation("M3-WT", wt.m3)
+m4.wt.cellnorm <- cellcountNormalisation("M4-WT", wt.m4)
+
+m <- wt.m1
+m.cellnorm <- m1.wt.cellnorm
+
+
+mpp.only <- m[m$cd62lhi > 0 | m$cd62lneg > 0,]
+
+mouse <- setCloneBias(mpp.only,threshold1 = 0.001, threshold2 = 0.004)
+
+#visualise the distribution of the biased clones
+qplot(asinh(mouse$cd62lneg) ,asinh(mouse$cd62lhi),col = mouse$bias) + geom_abline(intercept = 0,slope = 1, col = 'grey30') + scale_color_manual(values=c("blue", "red","grey60"))   +  geom_point(size=2)
+
+
+#subset the different clones based on their bias state
+mouse.hi<- mouse[mouse$bias == "cd62lhi",]
+mouse.neg <- mouse[mouse$bias == "cd62lneg",]
+mouse.not_shared <- mouse[mouse$bias != "None",]
+
+cd62lhi.barcodes <- rownames(mouse.hi)
+cd62lneg.barcodes <- rownames(mouse.neg)
+
+#heatmap visualisation of the biased clones
+heatmap(log(as.matrix(mouse.not_shared[,c(1,2,4)] + 1)) ,col=colorRampPalette(c("black","green","red"),bias = 2)(300),scale = "none",distfun = function(x) dist(x,method = 'euclidean'))
+
+
+#analysis 1 barcode diversity in M
+
+m.only <- mouse[mouse$M > 0,]
+
+plotDiversity(m.only)
+
+#analysis 2 clone size distributions, normalised to cell counts
+
+cloneSizeDistribution(m.cellnorm,cd62lneg.barcodes,cd62lhi.barcodes)
+
+#analysis 3 barcode lineage bias
+
+lineageBias(mouse)
+
+
+
+
+```
+
+
+
+
+```{r individuals_m2, echo=FALSE}
+
+m <- wt.m2
+m.cellnorm <- m2.wt.cellnorm
+
+
+mpp.only <- m[m$cd62lhi > 0 | m$cd62lneg > 0,]
+
+mouse <- setCloneBias(mpp.only,threshold1 = 0.001, threshold2 = 0.004)
+
+#visualise the distribution of the biased clones
+qplot(asinh(mouse$cd62lneg) ,asinh(mouse$cd62lhi),col = mouse$bias) + geom_abline(intercept = 0,slope = 1, col = 'grey30') + scale_color_manual(values=c("blue", "red","grey60"))   +  geom_point(size=2)
+
+
+#subset the different clones based on their bias state
+mouse.hi<- mouse[mouse$bias == "cd62lhi",]
+mouse.neg <- mouse[mouse$bias == "cd62lneg",]
+mouse.not_shared <- mouse[mouse$bias != "None",]
+
+cd62lhi.barcodes <- rownames(mouse.hi)
+cd62lneg.barcodes <- rownames(mouse.neg)
+
+#heatmap visualisation of the biased clones
+heatmap(log(as.matrix(mouse.not_shared[,c(1,2,4)] + 1)) ,col=colorRampPalette(c("black","green","red"),bias = 2)(300),scale = "none",distfun = function(x) dist(x,method = 'euclidean'))
+
+
+#analysis 1 barcode diversity in M
+
+m.only <- mouse[mouse$M > 0,]
+
+plotDiversity(m.only)
+
+#analysis 2 clone size distributions, normalised to cell counts
+
+cloneSizeDistribution(m.cellnorm,cd62lneg.barcodes,cd62lhi.barcodes)
+
+#analysis 3 barcode lineage bias
+lineageBias(mouse)
+
+
+
+
+```
+
+
+```{r individuals_m3, echo=FALSE}
+
+m <- wt.m3
+m.cellnorm <- m3.wt.cellnorm
+
+
+mpp.only <- m[m$cd62lhi > 0 | m$cd62lneg > 0,]
+
+mouse <- setCloneBias(mpp.only,threshold1 = 0.001, threshold2 = 0.004)
+
+#visualise the distribution of the biased clones
+qplot(asinh(mouse$cd62lneg) ,asinh(mouse$cd62lhi),col = mouse$bias) + geom_abline(intercept = 0,slope = 1, col = 'grey30') + scale_color_manual(values=c("blue", "red","grey60"))   +  geom_point(size=2)
+
+
+#subset the different clones based on their bias state
+mouse.hi<- mouse[mouse$bias == "cd62lhi",]
+mouse.neg <- mouse[mouse$bias == "cd62lneg",]
+mouse.not_shared <- mouse[mouse$bias != "None",]
+
+cd62lhi.barcodes <- rownames(mouse.hi)
+cd62lneg.barcodes <- rownames(mouse.neg)
+
+#heatmap visualisation of the biased clones
+heatmap(log(as.matrix(mouse.not_shared[,c(1,2,4)] + 1)) ,col=colorRampPalette(c("black","green","red"),bias = 2)(300),scale = "none",distfun = function(x) dist(x,method = 'euclidean'))
+
+
+#analysis 1 barcode diversity in M
+
+m.only <- mouse[mouse$M > 0,]
+
+plotDiversity(m.only)
+
+#analysis 2 clone size distributions, normalised to cell counts
+
+cloneSizeDistribution(m.cellnorm,cd62lneg.barcodes,cd62lhi.barcodes)
+
+
+
+lineageBias(mouse)
+
+
+
+```
+
+
+```{r individuals_m4, echo=FALSE}
+
+m <- wt.m4
+m.cellnorm <- m4.wt.cellnorm
+
+
+mpp.only <- m[m$cd62lhi > 0 | m$cd62lneg > 0,]
+
+mouse <- setCloneBias(mpp.only,threshold1 = 0.001, threshold2 = 0.004)
+
+#visualise the distribution of the biased clones
+qplot(asinh(mouse$cd62lneg) ,asinh(mouse$cd62lhi),col = mouse$bias) + geom_abline(intercept = 0,slope = 1, col = 'grey30') + scale_color_manual(values=c("blue", "red","grey60"))   +  geom_point(size=2)
+
+
+#subset the different clones based on their bias state
+mouse.hi<- mouse[mouse$bias == "cd62lhi",]
+mouse.neg <- mouse[mouse$bias == "cd62lneg",]
+mouse.not_shared <- mouse[mouse$bias != "None",]
+
+cd62lhi.barcodes <- rownames(mouse.hi)
+cd62lneg.barcodes <- rownames(mouse.neg)
+
+#heatmap visualisation of the biased clones
+heatmap(log(as.matrix(mouse.not_shared[,c(1,2,4)] + 1)) ,col=colorRampPalette(c("black","green","red"),bias = 2)(300),scale = "none",distfun = function(x) dist(x,method = 'euclidean'))
+
+
+#analysis 1 barcode diversity in M
+
+m.only <- mouse[mouse$M > 0,]
+
+plotDiversity(m.only)
+
+#analysis 2 clone size distributions, normalised to cell counts
+
+cloneSizeDistribution(m.cellnorm,cd62lneg.barcodes,cd62lhi.barcodes)
+
+
+lineageBias(mouse)
+
+
+
+```

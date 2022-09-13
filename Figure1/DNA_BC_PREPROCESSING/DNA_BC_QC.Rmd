@@ -1,0 +1,348 @@
+---
+title: "preprocessing of the DRAG barcoding data"
+author: "Jason Cosgrove and L Perié"
+date: "11/11/2021"
+output: html_document
+---
+
+## 1. Create the workspace
+```{r, include = TRUE}
+
+knitr::opts_chunk$set(echo = TRUE)
+#define working directory
+knitr::opts_knit$set(root.dir = '/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/MetaFate_final_pipeline/data/Step3_DNA_BC_processing/all_samples/freqthresh_1/')
+
+rm(list = ls())
+
+#define path
+path = "/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/MetaFate_final_pipeline/data/Step3_DNA_BC_processing/all_samples/freqthresh_1/"
+
+setwd(path)
+
+library(ggplot2)
+library(plyr)
+library(reshape2)
+library(stringr)
+
+```
+
+
+## 2. Define the helper methods we will use in the analysis
+```{r helperMethods, echo=FALSE}
+
+#change format of the data and generate a table with duplicates
+convertToLongFormat <- function(filtered.data){
+  d1 <- data.frame(filtered.data)
+  d1$tag <- paste(rownames(d1))
+  
+  d2 <- melt(d1, id.vars="tag")
+  d2<- d2[which(d2$value>0),]
+  d3 <- cbind( d2, ldply(strsplit(as.character(d2$variable), "_"), identity) ) # split the identifier column
+  
+  names(d3) <- c("tag","id","var","expt","mouse","celltype","rep") 
+  
+  d3<- d3[which(d3$var>0),]
+  da <- d3[which(d3$rep == 'a'),]#data of rep a
+  da <- da[,!colnames(da)=="rep"]#delete colonn rep
+  da <- da[,!colnames(da)=="id"]
+  row.names(da) <- NULL #delete the name of the row
+  dimnames(da) [[2]][2]<- "vara"#rename the colonn var en vara
+  db <- d3[which(d3$rep == 'b'),]#idem with b
+  row.names(db) <- NULL
+  db <- db[,!colnames(db)=="rep"]
+  db <- db[,!colnames(db)=="id"]
+  dimnames(db) [[2]][2]<- "varb"
+  dab <- merge(da,db,all=T)#create one table with a and b on the same row
+  dab[is.na(dab)]<-0 #delete na
+  return(dab)
+}
+
+
+#get all of the sample files from the demultiplexing and merge into a single matrix
+mergeSamples <- function(path){
+
+    #upload names of file in the folder
+    filenames <- list.files(path) %>% grep("cleaned", ., value = T, fixed = T)
+    
+    #load data and generate merge dataframe
+    #create table
+    M <- data.frame()
+  
+    #add first file
+    file_name <- str_sub(string = filenames[1])
+    file <- read.delim(paste0(path,filenames[1]),header=TRUE)
+    
+    file <- file[,c(1,3)]
+    
+    colnames(file) <- c("barcode",file_name)
+    
+    assign( x = file_name, value = file, envir = .GlobalEnv)
+    mergedData <- file
+    #add the rest of the files
+    
+    for (i in 2:length(filenames)) {
+      file_name <- str_sub(string = filenames[i])
+      file <- read.delim(paste0(path,filenames[i]),header=TRUE)
+      
+      file <- file[,c(1,3)]
+      
+      colnames(file) <- c("barcode",file_name)
+
+      mergedData <- merge(mergedData, file,all=TRUE)
+      assign( x = file_name, value = file, envir = .GlobalEnv)
+    }
+    
+    
+    
+    mergedData[is.na(mergedData)]<-0 # assign zero to Nas
+
+    rownames(mergedData) <- mergedData$barcode
+    mergedData <- mergedData[,-1]
+
+
+    samp.names <- read.csv("sample_names.csv",header = F)
+    colnames(mergedData) <- c(samp.names$V1)
+
+
+    return(mergedData)
+}
+
+
+# normalise each column to be between 0 and 1
+#input is the merged raw data
+# outputs a normalised dataset with samples with low read abundance filtered out
+normaliseData <- function(mergedData){
+  #normalization to 1
+
+  norm.data <- apply(mergedData,2, function(x) (x/sum(x)))
+  return(norm.data)
+}
+
+
+
+cellNumberNormalisation <- function(data,cell.numbers,merged){
+  expt <- vapply(strsplit(colnames(data),"_"), `[`, 1, FUN.VALUE=character(1))
+  mouse <- vapply(strsplit(colnames(data),"_"), `[`, 2, FUN.VALUE=character(1))
+  celltype <- vapply(strsplit(colnames(data),"_"), `[`, 3, FUN.VALUE=character(1))
+  
+  cell.norm.data <- data.frame(matrix(0, ncol= ncol(data), nrow= nrow(data)))
+  colnames(cell.norm.data) <- colnames(data)
+  rownames(cell.norm.data) <- rownames(data)
+  for(i in 1:ncol(data)){
+    
+    exp <- expt[i]
+    m <- mouse[i]
+  
+    c = "Myeloid"
+    if(celltype[i] == "M"){ c = "Myeloid"}
+    if(celltype[i] == "E"){ c = "Erythroid"}
+    
+    cell.count <- cell.numbers[cell.numbers$Expt == exp & cell.numbers$mouse == m,c]
+    
+    if(merged == FALSE){
+      cell.norm.data[,i] <- data[,i] * cell.count/2
+    }
+    
+    if(merged == TRUE){
+      cell.norm.data[,i] <- data[,i] * cell.count
+    }
+    
+  }
+
+  return(cell.norm.data)
+
+}
+
+
+```
+
+
+## 3. Merge all of the files into a single dataframe
+Load the demultiplexed reads for each sample and combine them into a single data frame. In this format the columns are samples, and the rows are barcodes. 
+```{r loadData, echo=TRUE}
+
+mergedData <- mergeSamples(path)
+
+#get rid of mice where we dont have technical replicates or both M and E samples
+mergedData <- mergedData[,!grepl("534",colnames(mergedData))]
+mergedData <- mergedData[,!grepl("M454_M_",colnames(mergedData))]
+
+```
+
+## 4. normalise data
+For each sample normalise the reads by dividing each barcode by the sample total. With this transformation all reads in a given sample sum to 1
+```{r norm, echo=TRUE}
+
+norm.data <- normaliseData(mergedData)
+
+```
+
+## 5. assess UMI thresholds
+some barcodes are not very common and may be the result of PCR or sequencing errors and do not represent true barcodes. We look at the cumulative UMI distribution to see what could be a sensible threshold to filter the barcodes on. 
+
+We filter samples based on the UMI abundance determined from the cumulative distribution of read counts
+```{r filter, echo=TRUE}
+
+#fraction threshold is 0.003 based on MEF data
+threshold=0.003
+
+#plot the cumulative read distribution to see if our read threshold is sensible
+for(i in 1:ncol(norm.data)){
+  P = ecdf(norm.data[,i])
+  plot(P)
+  abline(v=threshold, col="blue")
+}
+
+```
+
+
+## 6. Merge replicates
+For each sample we have a and b replicates, create a new dataframe where each value represents the summed a and b replicates
+```{r mergereplicates, echo=TRUE}
+#make a file with sum of duplicates
+#load data with duplicates
+d <- norm.data
+
+#add duplicates
+mergedReplicates <- as.data.frame(matrix(0, ncol = (dim(d)[2]-1)/2, nrow = dim(d)[1]))
+j=0
+for (i in seq(1,dim(d)[2],2)) {
+  j=j+1
+  mergedReplicates[,j] <- (d[,i]+d[,i+1])
+}
+
+names(mergedReplicates) <- c("JCW26_M1_M","JCW26_M1_E",
+                             "JCW26_M2_M","JCW26_M2_E",
+                             "JCW26_M3_M","JCW26_M3_E",
+                             "JCW26_M4_M","JCW26_M4_E",
+                             "ET27a_M1_M","ET27a_M1_E",
+                             "ET27b_M1_M","ET27b_M1_E",
+                             "ET21_M454_M")
+
+rownames(mergedReplicates) <- rownames(d)
+
+
+```
+
+## 7. renorm to cell numbers 
+We want to convert the data from a reads scale to a cell scale so we normalise based on cell numbers that we get from our cell sorting metadata. We do this for each replicate, and so perform the normalisation on the unmerged data
+```{r cellnumbernorm, echo=TRUE}
+
+cell.numbers <- read.csv("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/MetaFate_final_pipeline/data/Step3_DNA_BC_processing/cell_counts.csv")
+
+data.cell.norm <- cellNumberNormalisation(norm.data,cell.numbers,merged = FALSE)
+mergedReplicates.cell.norm <- cellNumberNormalisation(mergedReplicates,cell.numbers,merged = TRUE)
+
+```
+
+
+## 8. convert to long
+Convert the data to long format to facilitate plotting 
+```{r converttolong, echo=TRUE}
+
+dab <- convertToLongFormat(norm.data)
+dab.cellnorm <- convertToLongFormat(data.cell.norm)
+
+```
+
+## 9. Write unfiltered data to file
+```{r abfiltering1, echo=TRUE}
+
+#do the same but without the cell reconversion
+final.bcs <- unique(dab$tag)
+final.bc.matrix <- mergedReplicates[final.bcs,]
+final.bc.matrix.cellnorm <- mergedReplicates.cell.norm[final.bcs,]
+colSums(final.bc.matrix > 0)
+
+write.csv(final.bc.matrix, "DRAG_DNA_barcodes_normalised_no_ab_filtering.csv")
+write.csv(final.bc.matrix.cellnorm, "DRAG_DNA_barcodes_normalised_no_ab_filtering_cellnorm.csv")
+
+#plot new self/self before abfiltering
+qplot(asinh(vara), asinh(varb), data=dab) + 
+  facet_wrap(~paste(mouse,expt, celltype, sep = " _ "))
+
+#plot new self/self before abfiltering with cell normalisation
+qplot(asinh(vara), asinh(varb), data=dab.cellnorm) + 
+  facet_wrap(~paste(mouse,expt, celltype, sep = " _ "))
+
+```
+
+
+## 10. filtering based only on technical replicates
+remove barcodes which only occur in one of the two technical replicates
+```{r abfiltering2, echo=TRUE}
+
+dab.filtered <- dab[which(dab$vara>0 & dab$varb>0),]
+dab.cellnorm.filtered <- dab.cellnorm[which(dab$vara>0 & dab$varb>0),]
+final.bcs <- unique(dab.filtered$tag)
+
+final.bc.matrix <- mergedReplicates[final.bcs,]
+final.bc.matrix.cellnorm <- mergedReplicates.cell.norm[final.bcs,]
+colSums(final.bc.matrix > 0)
+
+write.csv(final.bc.matrix.cellnorm, "DRAG_DNA_barcodes_normalised_and_ab_filtered_cellnorm.csv")
+write.csv(final.bc.matrix, "DRAG_DNA_barcodes_normalised_and_ab_filtered.csv")
+colSums(final.bc.matrix > 0)
+
+
+qplot(asinh(vara), asinh(varb), data=dab.filtered) + 
+  facet_wrap(~paste( mouse,expt, celltype, sep = " _ "))
+qplot(asinh(vara), asinh(varb), data=dab.cellnorm.filtered) + 
+  facet_wrap(~paste( mouse,expt, celltype, sep = " _ "))
+
+
+```
+
+
+
+## 11. filtering based on either technical replicates or proportional abundance
+filter barcodes which only occur in one of the two technical replicates or if they are only in one sample then the proportional abundance of a barcode in a sample must be above a threshold value
+```{r abfiltering3, echo=TRUE}
+
+dab.filtered2 <- dab[(dab$vara>0 & dab$varb>0 | dab$vara > threshold| dab$varb > threshold) ,]
+dab.cellnorm.filtered2 <- dab.cellnorm[(dab$vara>0 & dab$varb>0 | dab$vara > threshold| dab$varb > threshold),]
+final.bcs2 <- unique(dab.filtered2$tag)
+final.bc.matrix2 <- mergedReplicates[final.bcs2,]
+final.bc.matrix.cellnorm2 <- mergedReplicates.cell.norm[final.bcs2,]
+colSums(final.bc.matrix2 > 0)
+
+write.csv(final.bc.matrix2, "DRAG_DNA_barcodes_normalised_and_ab_filtered2.csv")
+write.csv(final.bc.matrix.cellnorm2, "DRAG_DNA_barcodes_normalised_and_ab_filtered2_cellnorm.csv")
+
+qplot(asinh(vara), asinh(varb), data=dab.filtered2) + facet_wrap(~paste( mouse,expt, celltype, sep = " _ "))
+qplot(asinh(vara), asinh(varb), data=dab.cellnorm.filtered2) + facet_wrap(~paste( mouse,expt, celltype, sep = " _ "))
+
+```
+
+
+## 12. QC Plots: retention of RNA-DNA matche barcodes
+let's assess how well our filtering retains paired barcodes for which we have a higher confidence that they are a real barcode
+```{r abfiltering4, echo=TRUE}
+
+bc.pairs <- read.csv("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/MetaFate_final_pipeline/data/Step6_10X_Data_integration/DNA_RNA_BC_PAIRS/all_dna_rna_bc_pairs.csv")
+
+bc.pairs$expt <- vapply(strsplit(bc.pairs$expt_label,"_"), `[`, 1, FUN.VALUE=character(1))
+bc.pairs$mouse <- vapply(strsplit(bc.pairs$expt_label,"_"), `[`, 2, FUN.VALUE=character(1))
+expts <- unique(dab$expt)
+
+for(i in 1:length(expts)){
+  expt <- expts[i]
+  
+  dab.filtered <- dab.cellnorm.filtered2[dab.cellnorm.filtered2$expt == expt,]
+  bc.pairs.filtered <- bc.pairs[bc.pairs$expt == expt,]
+  pairs <- intersect(dab.filtered$tag,bc.pairs$all.bc.pairs)
+  
+  dab.filtered$paired <- "FALSE"
+  dab.filtered[dab.filtered$tag %in% pairs,]$paired <- "TRUE"
+  
+  #fp <- paste("/Users/jasoncosgrove/Desktop/",expt,threshold,".tiff",sep = "")
+  #tiff(fp, width = 6, height = 6,res = 200,units = "in")
+  p <- qplot(asinh(vara), asinh(varb), data=dab.filtered,colour = paired) + facet_wrap(~paste(celltype,mouse, sep = " _ "))
+  plot(p)
+  #dev.off()
+
+}
+
+```
+
+

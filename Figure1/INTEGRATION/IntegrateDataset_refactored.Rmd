@@ -1,0 +1,1115 @@
+---
+title: "RNAbarcoding of DRAG mice"
+output: html_document
+author: Jason Cosgrove (jason.cosgrove@curie.fr) 
+---
+
+<style type="text/css">
+
+body{ /* Normal  */
+      font-size: 12px;
+  }
+td {  /* Table  */
+  font-size: 8px;
+}
+h1.title {
+  font-size: 38px;
+  color: DarkRed;
+}
+h1 { /* Header 1 */
+  font-size: 28px;
+  color: DarkBlue;
+}
+h2 { /* Header 2 */
+    font-size: 22px;
+  color: DarkBlue;
+}
+h3 { /* Header 3 */
+  font-size: 18px;
+  font-family: "Times New Roman", Times, serif;
+  color: DarkBlue;
+}
+code.r{ /* Code block */
+    font-size: 12px;
+}
+pre { /* Code block - determines code spacing between lines */
+    font-size: 14px;
+}
+</style>
+
+
+
+
+
+In this study we combine lineage tracing and RNA sequencing to understand the metabolic regulators of hematopoietic stem and progenitor cell differentiation in vivo (MetaFate). 
+
+
+To perofrm metafate, we use the DRAG (Diversity through RAG) barcoding technology that allows endogenous barcoding of cellular lineages in situ in a temporally controlled manner. Specifically, CagCre+/- DRAG+/- mice are given a tamoxifen injection to induce barcode recombination.  Once cells are induced, all offspring of barcoded cells inherit the genetic-label and a GFP tag. As barcode transcripts have a poly(A) tail, they are directly detectable using standard single cell transcriptomics approaches. For each cell we can therefore obtain 3 pieces of information: (i) gene expression data (ii) a cellular barcode (iii) barcode abundance in the myeloid and erythroid lineages. 
+
+Specifically, barcoded LSKs (Sca1+ cKit+ GFP+), Cd11b+ GFP+ Myeloid and Ter119+ CD44+ GFP+ nucleated erythroid cells were isolated from the bone marrow of N mice using fluorescence activated cell sorting (FACS) 50-78 weeks after tamoxifen injection. HSPCs were then processed for single cell RNA sequencing and targeted barcode amplification using a customised version of 10X genomic protocol. In erythroid and myeloid cells, barcodes were detected from bulk cell populations at the DNA level with cells undergoing lysis and a nested PCR reaction. 
+
+In this script we combine information from the transcriptome together with lineage barcodes detected in HSPCs and in peripheral hematopoietic cells.
+
+
+
+
+# Step 1: Prepare the workspace, loading the appropriate packages and reading the data in with associated metadata
+ 
+```{r initialiseWorkspace, message = FALSE, warning = FALSE}  
+#clear the workspace
+rm(list=ls())
+#set the working directory and load in required libraries
+setwd("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/MetaFate_final_pipeline/pipeline_scripts/INTEGRATION/")
+library(Seurat)
+library(scran)
+library(org.Mm.eg.db)
+library(clustree)
+library(dplyr)
+library(enrichR)
+library(ggrepel)
+library(Rmagic)
+library(ggpubr)
+source("helper_methods_refactored.R")
+set.seed(12345)
+
+
+``` 
+
+
+# Step 2. generate the lineage barcode dataframe, which will be added to the metadata slot of the seurat objects
+
+```{r generate_barcode_metadata, message = FALSE, warning = FALSE}
+
+setwd("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/MetaFate_final_pipeline/data/Step6_10X_Data_integration")
+
+
+#update with the barcode metadata
+bc.metadata <- read.csv("DNA_RNA_BC_PAIRS/all_dna_rna_bc_pairs.csv")
+
+#make sure expt info is added to each barcode so that repeat use barcodes are not grouped across mice
+bc.metadata$Con.seq_perexpt <- paste(bc.metadata$Con.seq,"_",bc.metadata$expt,sep = "")
+
+#add the pgen probabilities to the metadata matrix
+bc.metadata <- updatePGEN(bc.metadata)
+
+#print key statistics about barcodes in the dataset
+printBarcodeSummaryStatistics(bc.metadata)
+
+
+``` 
+
+
+# Step 3. load in the 10X expression matrices, preprocessed by the CellRanger pipeline, and convert them into seurat objects. 
+
+```{r load_data, message = FALSE, warning = FALSE}  
+
+root_path <- "/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/MetaFate_final_pipeline/data/Step5_10X_cell_ranger_QC/"
+
+m1 <- Read10X(data.dir= paste(root_path,"exp4_ET27a/cell_ranger_matrix/",sep = "")) 
+m2 <- Read10X(data.dir= paste(root_path,"exp5_ET27b/cell_ranger_matrix/",sep = "")) 
+m3 <- Read10X(data.dir= paste(root_path,"exp6_JCW26/cell_ranger_matrix/M2/",sep = "")) 
+m4 <- Read10X(data.dir= paste(root_path,"exp6_JCW26/cell_ranger_matrix/M3/",sep = "")) 
+m5 <- Read10X(data.dir= paste(root_path,"exp6_JCW26/cell_ranger_matrix/M4/",sep = "")) 
+
+#create a list of seurat objects, one for each experiment
+dataset.list <- CreateSeuratObjects(m1,m2,m3,m4,m5,bc.metadata)
+
+```
+
+
+# Step 4. Perform data QC preprocessing
+
+To assess the quality of the data we assess the library sizes, numbers of genes expressed and mitochondrial content per cell. Cells which have very high library sizes or relative to other cells in the data may represent doublet cells and so are filtered out. Cells with very low library sizes are typically because of poor capture quality pontentially due to cell death, premature rupture, or capture of random mRNA escaping from cells, consequently cells with low library sizes are also filtered out from downstream analyses. 
+
+Another important QC metric is mitochondrial content. As discussed in AlJanahi et al (2018) "High numbers of mitochondrial transcripts are indicators of cell stress, and therefore cells with elevated mitochondrial gene expression are often not included in the analysis, because most experiments will not benefit from clustering cells based on stress levels. However, just as with number of transcripts, this parameter is highly dependent on the tissue type and the questions being investigated. For example, 30% of total mRNA in the heart is mitochondrial due to high energy needs of cardiomyocytes, compared with 5% or less in tissues with low energy demands. For instance, 30% mitochondrial mRNA is representative of a healthy heart muscle cell, but would represent a stressed lymphocyte." Here as we are studying metabolism we need to be very careful about using this filter. 
+
+```{r filterData, message = FALSE, warning = FALSE}  
+
+#add the percentage of reads that map to mitochondrial reads, this will be used as a QC metric in the next section
+dataset.list <- update_QC_metadata(dataset.list)
+
+######## mouse 1
+VlnPlot(dataset.list[[1]], features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+dataset.list[[1]] <- subset(x = dataset.list[[1]], subset = nCount_RNA > 500 & nCount_RNA < 50000 & nFeature_RNA > 500
+               & nFeature_RNA < 7000 & percent.mt < 10 & percent.mt > 1)
+
+######## mouse 2
+
+VlnPlot(dataset.list[[2]], features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+dataset.list[[2]] <- subset(x =dataset.list[[2]], subset = nCount_RNA > 1000 & nCount_RNA < 90000 & nFeature_RNA > 500
+               & nFeature_RNA < 7500 & percent.mt < 10 & percent.mt > 2)
+
+######## mouse 3
+VlnPlot(dataset.list[[3]], features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+dataset.list[[3]] <- subset(x =dataset.list[[3]], subset = nCount_RNA > 500 & nCount_RNA < 40000 & nFeature_RNA > 500
+               & nFeature_RNA < 6000 & percent.mt < 10 & percent.mt > 1)
+
+######## mouse 4
+VlnPlot(dataset.list[[4]], features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+dataset.list[[4]] <- subset(x =dataset.list[[4]], subset = nCount_RNA > 500 & nCount_RNA < 50000 & nFeature_RNA > 500
+               & nFeature_RNA < 6000 & percent.mt < 10 & percent.mt > 2)
+
+######## mouse 5
+VlnPlot(dataset.list[[5]], features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+dataset.list[[5]] <- subset(x =dataset.list[[5]], subset = nCount_RNA > 500 & nCount_RNA < 50000 & nFeature_RNA > 300
+               & nFeature_RNA < 6000 & percent.mt < 10 & percent.mt > 2)
+
+#for this specific analysis we dont care about unannotated genes, or ribosomal genes so let's filter them out
+for (i in 1:length(dataset.list)) {
+  sobj <- dataset.list[[i]]
+  dataset.list[[i]] <- removeUninformativeGenes(sobj)
+}
+
+
+```
+
+
+
+# Step 5. Find variably expressed genes and normalise the data
+
+When analyzing sequencing data, normalization to eliminate batch effects is crucial if multiple sequencing runs are to be compared with each other. These batch effects can be caused by often unavoidable technical variations such as the duration samples were kept on ice, number of freeze-thaw cycles, method of RNA isolation, sequencing depth, etc.
+
+An additional consideration is that droplet-based sequencing in addition consists of thousands of individual cell experiments, hence cell-specific biases must also be considered when normalizing, in order to be able to compare the expression of one cell to another.  A notable cell-specific bias is caused by mRNA capture efficiency, where the mRNA molecules are not captured by the bead at the same proportion in all droplets. As individual cells are not all of the same type a key consideration is how to retain cell to cell variability while eliminating technical noise. To normalise our data we use  the default seurat method. For the default method feature counts for each cell are divided by the total counts for that cell and multiplied by the scale.factor. This is then natural-log transformed using log1p. 
+
+To find variably expressed genes of interest to take forward for further analysis we use Seurats vst method. Briefly, this approach models the relationship between log mean expression and log variance using local polynomial regression. The features values are then standardized using the observed mean and predicted variance, with the final variance value calculated on the standardized values. 
+```{r normalise_data, message = FALSE, warning = FALSE}  
+
+for (i in 1:length(dataset.list)) {
+    dataset.list[[i]] <- NormalizeData(dataset.list[[i]], verbose = FALSE)
+    dataset.list[[i]] <- FindVariableFeatures(dataset.list[[i]], selection.method = "vst", nfeatures = 4000, verbose = FALSE)
+}
+
+```
+
+
+# Step 6. Integrate the datasets
+
+Seurat v4 includes a set of methods to match (or ‘align’) shared cell populations across datasets. These methods first identify cross-dataset pairs of cells that are in a matched biological state (‘anchors’), can be used both to correct for technical differences between datasets (i.e. batch effect correction), and to perform comparative scRNA-seq analysis of across experimental conditions.
+
+```{r integrate_data, message = FALSE, warning = FALSE}  
+
+features <- SelectIntegrationFeatures(object.list = dataset.list,
+                                      nfeatures = 4000)
+dataset.anchors <- FindIntegrationAnchors(object.list = dataset.list,anchor.features = features, dims = 1:15)
+dataset.integrated <- IntegrateData(anchorset = dataset.anchors, dims = 1:15)
+DefaultAssay(dataset.integrated) <- "integrated"
+
+VlnPlot(dataset.integrated, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+```
+
+
+# Step 7. Perform CellCycle Annotation
+
+To assign a cell cycle phase to each cell, we use the cyclone method in the R package scran. In this scheme, a supervised learning approach was used to identify pairs of markers for each cell cycle phase. A G1 marker pair would comprise a gene with high expression in G1 relative to other phases, while the second gene would be lower in G1 relative to all other phases. To classify cell cycle phase on a new dataset, cyclone calculates the proportion of all marker pairs for which the expression of the first gene is higher than the second gene. A high proportion then suggests that the cell belongs to a given cell cycle phase. 
+
+```{r annotateCellCycle, message = FALSE, warning = FALSE}  
+
+dataset.integrated <- cellCycleAnalysis(dataset.integrated)
+table(dataset.integrated@meta.data$phases)
+saveRDS(dataset.integrated,file = "sobj_integrated.Rda")
+
+```
+
+
+# Step 8. Linear Dimensionality Reduction
+We perform dimensionality reduction on variably expressed genes using both principle component analysis, an approach to find the linear combination of genes that are the greatest source of variance in the data.
+
+Based on an elbow plot visualisation of the data, the first 10-15 PCs capture the majority of the variance in our integrated dataset. This is important later on when we decide how many PCs we use for clustering and UMAP visualistion of the data. 
+
+```{r dimension_reduction, message = FALSE, warning = FALSE}  
+
+dataset.integrated <- readRDS("sobj_integrated.Rda")
+
+table(dataset.integrated$orig.ident,dataset.integrated$barcoded)
+
+#first lets run PCA on the data
+dataset.integrated <- ScaleData(dataset.integrated, verbose = FALSE)
+dataset.integrated <- RunPCA(dataset.integrated, npcs = 30, verbose = FALSE)
+
+ElbowPlot(dataset.integrated,ndims = 30)
+VizDimLoadings(dataset.integrated, dims = 1:4, reduction = "pca",nfeatures = 20)
+
+DimPlot(dataset.integrated, reduction = "pca", group.by = "phases",dims=c(1,2))
+DimPlot(dataset.integrated, reduction = "pca", group.by = "orig.ident",dims=c(1,2))
+
+```
+
+
+Let's see how the barcodes are distributed in PCA space
+
+
+```{r overlay_bc_info, message = FALSE, warning = FALSE} 
+
+all.barcoded.cells <-  colnames(dataset.integrated)[dataset.integrated$barcoded == TRUE]
+
+DimPlot(object = dataset.integrated, label = T,reduction = "pca", pt.size = 1.0,group.by = "barcoded",cells.highlight = all.barcoded.cells,cols = c("light grey", "light blue"), cols.highlight = "dark red", sizes.highlight = 1.2,label.size = 0,dims=c(1,2)) + NoLegend()
+
+```
+
+
+
+
+
+```{r remove_PCA_outliers, message = FALSE, warning = FALSE,eval = FALSE}  
+
+#Some cells are visible outliers on our PCA plot, overlaying technical information about library sizes and mitochondrial content suggests that our initial QC filters were not stringent enough and so we remove these outlier cells. 
+
+#Cells on the right hand side of the plot have lower library counts, fewer genes detected, higher mitochondrial reads and less lineage barcodes. Taken together this suggests that these cells are outliers for technical reasons and should be removed from the dataset before further analysis. 
+
+#as we can see on our PCA plot we have a small subset of outliers, lets see if this is due  a technical factor such as cell cycle
+FeaturePlot(dataset.integrated, reduction = "pca", 
+            features = c("nFeature_RNA","nCount_RNA","percent.mt"),
+            dims =c(1,2),min.cutoff = "q1", max.cutoff = "q99")
+
+outliers <- rownames(dataset.integrated@reductions$pca@cell.embeddings)[
+  dataset.integrated@reductions$pca@cell.embeddings[,1] > 20 ] 
+
+cells.to.keep <- colnames(dataset.integrated)[colnames(dataset.integrated) %ni% outliers ]
+dataset.integrated <- subset(dataset.integrated, cells = cells.to.keep )
+
+dataset.integrated <- RunPCA(dataset.integrated, npcs = 30, verbose = FALSE)
+
+DimPlot(object = dataset.integrated, label = T,reduction = "pca", pt.size = 1.0,group.by = "barcoded",cells.highlight = all.barcoded.cells,cols = c("light grey", "light blue"), cols.highlight = "dark red", sizes.highlight = 1.2,label.size = 0,dims=c(1,2)) + NoLegend()
+
+```
+
+
+
+# Step 10. Non-Linear Dimensionality Reduction
+
+
+We visualize our data using the non-linear dimensionality reduction technique UMAP. This approach is analogous to PCA, but can also identify non-linear patterns in the data. The goal of the algorithm is to learn the underlying manifold of the data in order to place similar cells together in low-dimensional space. UMAP is preferable to t-SNE as it is faster to compute, and better captures local vs long range distances in the data. 
+```{r UMAP, message = FALSE, warning = FALSE} 
+
+dataset.integrated <- RunUMAP(dataset.integrated, dims = 1:15,reduction = "pca",spread = 60) 
+
+DimPlot(dataset.integrated, reduction = "umap", group.by = "orig.ident",pt.size = 1)
+
+FeaturePlot(dataset.integrated, reduction = "umap", 
+            features = c("nFeature_RNA","nCount_RNA","percent.mt"),
+            dims =c(1,2),min.cutoff = "q1", max.cutoff = "q99")
+
+
+#tiff("UMAP_cellcycle.tiff",
+#     width = 8, height = 5, units = 'in', res = 300)
+DimPlot(dataset.integrated, group.by = "phases",reduction = "umap",split.by = "phases", cols =c("plum", "cornflowerblue", "darkolivegreen3")) 
+#dev.off()
+
+#tiff("UMAP_mice.tiff",
+#     width = 8, height = 5, units = 'in', res = 300)
+DimPlot(dataset.integrated, group.by = "orig.ident",reduction = "umap",split.by = "orig.ident",cols = c("light grey", "cornflowerblue", "darkolivegreen3","orange", "plum")) 
+#dev.off()
+
+#tiff("UMAP_barcoded.tiff",
+#     width = 5, height = 5, units = 'in', res = 300)
+DimPlot(object = dataset.integrated, label = T,reduction = "umap", pt.size = 1.0,group.by = "barcoded",cells.highlight = all.barcoded.cells,cols = c("grey80", "green"), cols.highlight = "dark red", sizes.highlight = 1.0,label.size = 0,dims=c(1,2)) + NoLegend()
+#dev.off()
+
+```
+
+
+
+#Step 19. Supervised annotation
+
+Here we use gene sets from the literature to define regions of interest on our UMAP
+
+```{r supervised_annotation, message = FALSE, warning = FALSE} 
+
+gene.sets <- read.csv("genesets.csv")
+
+dataset.integrated <- geneSignatureScoring(dataset.integrated, gene.sets, colnames(gene.sets),assay = "RNA")
+
+
+#tiff("MPP_sigs.tiff",
+#     width = 8, height = 6, units = 'in', res = 300)
+FeaturePlot(object = dataset.integrated, features = c("WilsonMolO1", 
+            "Pia_MPP21","Pia_MPP31","Pia_MPP41"), pt.size = 1.0,
+            min.cutoff = "q30",max.cutoff = "q99", 
+            cols = c("grey90","black"))
+#dev.off()
+
+```
+
+
+#Step 20. Annotate barcoded cells
+```{r set_diff_active, message = FALSE, warning = FALSE} 
+
+diff.active.barcoded.cells <- colnames(dataset.integrated)[rowSums(dataset.integrated@meta.data[,c("Myeloid","Erythroid")]) > 0]
+
+diff.active <- subset(dataset.integrated,cells = diff.active.barcoded.cells)
+
+
+expr <- as.matrix(dataset.integrated@assays$RNA@data)
+
+write.csv(expr,'/Users/jasoncosgrove/Desktop/normalised_expression_matrix.csv')
+
+
+write.csv(dataset.integrated@meta.data,'/Users/jasoncosgrove/Desktop/metadata.csv')
+
+```
+
+
+Here we define a bias score for diffrentiation active progenitors. This is calculated by dividing barcode frequency in Myeloid lineage by the sum of barcode frequencies across the myeloid and erythroid lineages
+
+```{r set_bias_score, message = FALSE, warning = FALSE} 
+
+diff.active$bias.score <- diff.active@meta.data$Myeloid/ (diff.active@meta.data$Myeloid + diff.active@meta.data$Erythroid)
+dataset.integrated$bias.score <- 0
+dataset.integrated@meta.data[colnames(diff.active),]$bias.score <- diff.active@meta.data$bias.score 
+
+FeaturePlot(diff.active,"bias.score",min.cutoff = "q20", max.cutoff = "q80", 
+            cols = c("black","green"))
+```
+
+Now we have calculated a lineage bias score we should set a threhsold value for cells that are considered lineage restricted. After a sensitivity analysis
+
+
+
+As we are not certain which bias threshold is the most appropriate we perform a sensitivity analysis- seeing how our differentially expressed genes change as a function of bias threshold. 
+
+```{r diffThresholds, message = FALSE, warning = FALSE} 
+
+fp <- '/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/MetaFate_final_pipeline/data/Step6_10X_Data_integration/outputs/bias_threshold_sensitivity_analysis/'
+
+
+number_of_DEGs_per_threshold(fp)
+
+DEGs_overlap(fp)
+
+log2FC_per_threshold(fp) 
+
+number_of_cells_per_threshold(diff.active)
+
+
+```
+
+Based on this sensitivity analysis 0.75 seems to be a sensible cutoff
+
+```{r set_bias_classifier, message = FALSE, warning = FALSE} 
+
+#lets consider the 25th and 75th percentiles as reasonable cutoffs. What this means is that if we take one barcode and it has a bias score of 0.8 then if we take the sum of the fractional contributions, myeloid would account for 80% of that. e.g. BC is 4 times higher on proportional scale in M than in E
+hist(diff.active$bias.score)
+abline(v=quantile(diff.active$bias.score,0.75),col="red",lwd=4)
+abline(v=quantile(diff.active$bias.score,0.25),col="red",lwd=4)
+
+diff.active <- setLineageBias(diff.active, 0.25,0.75)
+
+ggplot(data = diff.active@meta.data, aes(asinh(Myeloid_cellnorm), asinh(Erythroid_cellnorm), colour = bias))+ 
+  geom_point()
+DimPlot(diff.active,group.by = "bias", reduction = "umap")
+
+
+```
+
+
+
+# Step 17. Classify barcodes as M, E, or diff_inactive based on thresholds
+```{r set_bias_classifier2, message = FALSE, warning = FALSE} 
+
+bc <- subset(dataset.integrated,cells = all.barcoded.cells)
+bc <- setDiffBias(bc)
+
+bc <- SetIdent(bc,value = "bias")
+table(bc@meta.data$bias)
+table(bc@meta.data$bias,bc$orig.ident)
+
+
+
+
+#tiff("UMAP_clones.tiff",
+#     width = 5, height = 5, units = 'in', res = 300)
+bc.subset <- subset(bc,cells = colnames(bc)[bc$bias != "unbiased"])
+DimPlot(object = bc.subset, label = F,reduction = "umap", pt.size = 2.0,group.by = "bias",dims=c(1,2),
+        cols = c("grey30","red","blue","grey80"),ncol = 1) + NoLegend()
+#dev.off()
+
+
+```
+
+
+```{r density_plots, message = FALSE, warning = FALSE} 
+Idents(object = bc) <- "bias"
+di <- subset(bc,idents = c("diff_inactive"))
+e <- subset(bc,idents = c("E"))
+m <- subset(bc,idents = c("M"))
+
+p1 <- createDensityPlot(di, bins = 50) + NoLegend()
+p2 <- createDensityPlot(e, bins = 50) + NoLegend()
+p3 <- createDensityPlot(m,bins = 50) + NoLegend()
+
+#tiff("clonedensity.tiff",
+#     width = 4, height = 10, units = 'in', res = 300)
+ggarrange(p1, p2,p3,ncol = 1, nrow = 3)
+#dev.off()
+
+```
+
+
+
+It is possible during recombination that two independent cells get the same label. We use the IGOR probability model and the frequency of barcode occurrences across mice to estimate how frequently this occurs. 
+
+
+```{r pgen, message = FALSE, warning = FALSE} 
+
+hist(bc$pgen, main = "distribution of pgen values")
+
+
+df <- VlnPlot(bc,"pgen",group.by = "bias")
+ggplot(df$data, aes(x = ident, y  = pgen,color=ident)) + geom_boxplot() + geom_jitter() + ggtitle("pgen values for each barcode class")
+
+
+#calculate the repeat use of barcodes across mice
+repeat.use <- table(bc$Con.seq,bc$orig.ident)
+repeat.use.barcodes <- rownames(repeat.use[rowSums(repeat.use != 0) > 1,])
+cells <- rownames(bc@meta.data[bc$Con.seq %in% repeat.use.barcodes,])
+ru <- subset(bc, cells = cells)
+
+barplot(table(ru$bias), main = "frequency of repeat use barcodes",ylab = "number of cells with repeat use barcodes")
+
+
+df <- VlnPlot(ru,"pgen",group.by = "bias")
+ggplot(df$data, aes(x = ident, y  = pgen,color=ident)) + geom_boxplot() + geom_jitter() + ggtitle("pgen values for repeat use barcodes")
+
+#sanity check: barcodes with a high pgen and occur across different mice have a higher likelihood of labelling multiple cells. Are these barcodes more likely to be unbiased
+true.repeat.use <- rownames(ru@meta.data)[ru$pgen > 0.002]
+true.ru <- subset(bc, cells = true.repeat.use)
+df <- VlnPlot(true.ru,"pgen",group.by = "bias")
+
+ggplot(df$data, aes(x = ident, y  = pgen,color=ident)) + geom_boxplot() + geom_jitter() + ggtitle("pgen values for high probability repeat use barcodes")
+
+barplot(table(true.ru$bias), main = "frequency of high probability repeat use barcodes",ylab = "number of cells with repeat use barcodes")
+
+```
+
+It is important to note that repeat use barcodes are troublesome because a cell can appear multipotent when in fact this is not the case. Because we use a classifier approach that focused on lineage restricted cells in our analysis there is a low probability that repeat use barcodes will be lineage restricted. Because we set a strict threshold for lineage bias it is not necessary to filter on pgen values for downstream analyses
+
+
+
+# Sensitivity Analysis of Bias Thresholds
+
+
+
+# Step 18. Unsupervised clustering
+
+To look at whether age affects a specific subcompartment of LSK cells we perform clustering using Seurats default approach. Briefly, this approach involves embedding cells in a graph structure such as a K-nearest neighbour graph, with edges drawn between cells with similar feature expression patterns, and then attempts to partition this graph into a number of highly interconnected subgroups. As LSK cells do not form discrete clusters, but rather show a smooth continuum of expression, our clustering results were sensitive to the resolution parameter of Seurats clustering algorithm. We do see from the clustree plot that there are  6 major subgroups of cells
+
+
+Looking at the plots we see a lot of erythroid and myeloid associated barcodes within the clusters 0 and 1. This suggests that most of the differentiation active HSPCs are found in these clusters. CHanging the resolution parameter of the algorithm doesnt seem to further separate out the myeloid and the erythroid progenitors
+
+
+
+```{r clusterSensitivity, message = FALSE, warning = FALSE} 
+
+
+clusterSensitivityAnalysis <- function(dataset.integrated){
+  
+    dataset.integrated <- FindNeighbors(object = dataset.integrated, 
+                           dims = 1:10,reduction = "pca",
+                            verbose = TRUE,force.recalc = TRUE)
+    
+    algo <- 1
+    
+    for(i in seq(from=0.1, to=1.0, by=0.1)){
+       dataset.integrated <- FindClusters(object = dataset.integrated, resolution = i,algorithm = algo, verbose = FALSE)
+        
+    }    
+    
+    p <- clustree(dataset.integrated)
+    plot(p)
+    return(dataset.integrated)
+
+}
+
+
+dataset.integrated <- clusterSensitivityAnalysis(dataset.integrated)
+
+s <- subset(dataset.integrated,cells = all.barcoded.cells)
+
+
+#tiff("res1.tiff",
+#     width = 6, height = 6, units = 'in', res = 300)
+df <- (table( bc$bias ,s$integrated_snn_res.0.1))
+opar <- par(lwd = 2)
+barplot(t(t(df) /colSums(df)),legend = TRUE,col = c("grey50","red","blue","grey90"),
+        xlab = "cluster index",ylab = "proportional representation in cluster",
+        main = "clustering resolution = 0.1",
+        args.legend = list(x = "topleft"))
+
+#dev.off()
+
+#tiff("res2.tiff",
+#     width = 6, height = 6, units = 'in', res = 300)
+df <- (table( bc$bias ,s$integrated_snn_res.0.4))
+opar <- par(lwd = 2)
+barplot(t(t(df) /colSums(df)),legend = F,col = c("grey50","red","blue","grey90"),
+        xlab = "cluster index",ylab = "proportional representation in cluster",
+        main = "clustering resolution = 0.4")
+#dev.off()
+
+#tiff("res3.tiff",
+#     width = 6, height = 6, units = 'in', res = 300)
+df <- (table( bc$bias ,s$integrated_snn_res.0.8))
+opar <- par(lwd = 2)
+barplot(t(t(df) /colSums(df)),legend = F,col = c("grey50","red","blue","grey90"),
+        xlab = "cluster index",ylab = "proportional representation in cluster",
+        main = "clustering resolution = 0.8")
+#dev.off()
+
+
+#clustering gives you inactive vs active rather than bias
+
+```
+
+
+
+# Step 18. Differential expression testing between biased clones
+Based on our above bias classifier lets perform differential expression testing to identify key genes of interest
+
+```{r DEGs, message = FALSE, warning = FALSE} 
+
+bc <- SetIdent(bc,value = "bias")
+diff.active <- SetIdent(diff.active,value = "bias")
+bc@active.assay <- 'RNA'
+
+
+m <- FindConservedMarkers(bc,ident.1 = "M", ident.2= c("E","diff_inactive"),grouping.var = 'orig.ident',test.use = "LR",logfc.threshold = 0.01,meta.method = metap::sumlog)
+
+
+m$avg_log2FC <-  rowMeans(m[,grepl('log2FC',colnames(m))])
+
+m.filtered <- m[m$minimump_p_val<= 0.05  & 
+                  rowMeans(m[,grepl('log2FC',colnames(m))]) > 0.1 ,]
+
+m.filtered.neg <- m[m$minimump_p_val<= 0.05  & 
+                  rowMeans(m[,grepl('log2FC',colnames(m))]) < -0.1 ,]
+
+m.all <- m[m$minimump_p_val<= 0.05  & 
+                  abs(rowMeans(m[,grepl('log2FC',colnames(m))])) > 0.1 ,]
+
+write.csv(m.all,"cloneDEGs_M_allgenes.csv")
+
+
+
+m.filtered <- m.filtered[order(m.filtered$avg_log2FC,decreasing = TRUE),]
+m.filtered.neg <- m.filtered.neg[order(m.filtered.neg$avg_log2FC),]
+m.fate <- rownames(m.filtered)
+m.fate.neg <- rownames(m.filtered.neg)
+
+
+```
+
+
+```{r volcanoPlot, message = FALSE, warning = FALSE} 
+
+
+gene.list <- c("Cd48","Sell","Mpo","Ms4a3","Ctsg","Cd74","Cpa3","Ly6a","Cd79b","Kit","S100a8",
+               "Cepbe",'Clec21a',"Gng11","Mecom","Hlf","Nupr1")
+
+
+#tiff("/Users/jasoncosgrove/Desktop/M_DEGs.tiff",
+#     width = 6, height = 4, units = 'in', res = 300)
+volcanoPlotHSPC(m,gene.list)
+#dev.off()
+
+
+
+gene.list.metabolic <- c("Hk1","Slc20a2","Ldhb","Slc16a1","Ndufs3", "Idh2","Fut7","Pgam1","Gpi1","Taldo1","Tkt",
+               "Abca3","Idh3a","Kyat3")
+
+volcanoPlotHSPC(m,gene.list.metabolic)
+
+```
+
+```{r Pathways, message = FALSE, warning = FALSE} 
+
+
+listEnrichrDbs()
+
+
+go <- DEenrichRPlot(
+  bc,
+  ident.1 = "M",
+  ident.2 = c("E","diff_inactive"),
+  balanced = TRUE,
+  logfc.threshold = 0.1,
+  assay = NULL,
+  max.genes = 2000,
+  test.use = "LR",
+  p.val.cutoff = 0.05,
+  cols = NULL,
+  enrich.database = c("GO_Biological_Process_2021"),
+  num.pathway = 100,
+  return.gene.list = TRUE
+)
+
+write.csv(go,'/Users/jasoncosgrove/Desktop/enrich_pathway_GO.csv')
+
+kegg <- DEenrichRPlot(
+  bc,
+  ident.1 = "M",
+  ident.2 = c("E","diff_inactive"),
+  balanced = TRUE,
+  logfc.threshold = 0.1,
+  assay = NULL,
+  max.genes = 3000,
+  test.use = "LR",
+  p.val.cutoff = 0.05,
+  cols = NULL,
+  enrich.database = c("KEGG_2019_Mouse"),
+  num.pathway = 30,
+  return.gene.list = TRUE
+)
+
+head(kegg)
+write.csv(kegg,'/Users/jasoncosgrove/Desktop/enrich_pathway.csv')
+
+
+```
+# Step 19. subset the DEGs to focus on metabolism
+
+get the differentially expressed genes that relate to metabolism
+
+```{r DEGs_metabolic, message = FALSE, warning = FALSE} 
+
+#make a gene set that relates to metabolism
+load('/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/JCB4_metabolism_bioinformatics_pipeline/genesets/geneset_Robjects/metabolic_signatures_DRAG.Rda')
+m.metab <- intersect(metabolic.signatures$allGenesTested,m.fate)
+m.metab <- c(m.metab,"Fut7")
+
+#make a gene set that relates to TF activity
+load("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/JCB4_metabolism_bioinformatics_pipeline/genesets/geneset_Robjects/GO.Rda")
+TF.genes <- unique(unlist(GO.sets[names(GO.sets)[grepl("transcription factor activity",names(GO.sets))]]))
+m.tf <- intersect(TF.genes,m.fate)
+
+
+
+metabolic.signatures$metafate_m <- m.metab
+metabolic.signatures$fate_m <- m.fate
+
+save(metabolic.signatures,file = '/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/JCB4_metabolism_bioinformatics_pipeline/genesets/geneset_Robjects/metabolic_signatures_metafate.Rda')
+
+
+
+dataset.integrated <- AddModuleScore(dataset.integrated , features = list(m.metab),
+                           name = "m_metab",replace = TRUE,assay = "RNA")
+
+
+dataset.integrated <- AddModuleScore(dataset.integrated , features = list(m.fate),
+                           name = "m_fate",replace = TRUE,assay = "RNA")
+
+#tiff("M_sig2.tiff",
+#     width = 8, height = 4, units = 'in', res = 300)
+FeaturePlot(dataset.integrated,c("m_fate1","m_metab1"), cols = c("grey80",rgb(67/255,138/255,201/255,1)),
+            min.cutoff = "q5", max.cutoff = "q95",reduction = "umap",pt.size = 1.2) 
+#dev.off()
+
+
+```
+
+# Step 19. Permutation testing to assess significance of our signatures
+
+```{r permutation_test, message = FALSE, warning = FALSE} 
+
+sobj <- bc
+
+m.perm <- permutationTest(m.fate,sobj,"bias.score",200)
+m.metab.perm <- permutationTest(m.metab,sobj,"bias.score",200)
+m.tf.perm <- permutationTest(m.tf,sobj,"bias.score",200)
+mpp3.perm<- permutationTest(unique(gene.sets$Pia_MPP3),sobj,"bias.score",200)
+
+
+
+bc<- AddModuleScore(bc, features = list(rownames(m.filtered)),
+                           name = "M_fate",replace = TRUE,assay = "RNA")
+
+bc<- AddModuleScore(bc, features = list(m.tf),
+                           name = "M_tf",replace = TRUE,assay = "RNA")
+
+bc<- AddModuleScore(bc , features = list(m.metab),
+                           name = "m_metab",replace = TRUE,assay = "RNA")
+
+bc<- AddModuleScore(bc , features = list(gene.sets$Pia_MPP3),
+                           name = "Pia_MPP3",replace = TRUE,assay = "RNA")
+
+
+cor.test( bc$M_fate1,
+          bc$bias.score, method = "spearman")$estimate
+quantile(m.perm, probs = c(0.05,0.95))
+
+cor.test( bc$m_metab1,
+          bc$bias.score, method = "spearman")$estimate
+quantile(m.metab.perm, probs = c(0.05,0.95))
+
+cor.test( bc$Pia_MPP31,
+          bc$bias.score, method = "spearman")$estimate
+quantile(mpp3.perm, probs = c(0.05,0.95))
+
+cor.test( bc$M_tf1,
+          bc$bias.score, method = "spearman")$estimate
+quantile(m.tf.perm, probs = c(0.05,0.95))
+
+
+plotPermutationResults()
+
+
+
+```
+
+############### Check how well our results generalise to other datasets  ##################
+
+
+
+
+Weinreb and Fraticelli et al.comprises 28,249 cKit+ and cKit+ Sca1+ progenitors that were lentivirally barcoded and cultured for 2 days in vitro. In this analysis cells were classified as M, Mk, E or L biased on whether the majority of cells within that clone are found within the lymphoid, myeloid, megakaryocyte and lymphoid clusters defined in the original publication. Cells that were undifferentiated or that could not be assigned to a lineage in this manner were excluded from further analysis.
+
+```{r weinreb, echo=FALSE, eval= FALSE}
+
+setwd("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/JCB4_metabolism_bioinformatics_pipeline")
+load("datasets/Weinreb/Weinreb.Rda")
+
+weinreb <- AddModuleScore(weinreb , features = list(m.fate),
+                           name = "m_fate",replace = TRUE,assay = "RNA")
+
+weinreb <- AddModuleScore(weinreb , features = list(m.metab),
+                           name = "m_metab",replace = TRUE,assay = "RNA")
+
+weinreb <- AddModuleScore(weinreb , features = list(gene.sets$Pia_MPP3),
+                           name = "mpp3",replace = TRUE,assay = "RNA")
+
+lsks.cellid <- colnames(weinreb)[weinreb$Time_point == 2 ]
+lsks <- subset(weinreb,cells = lsks.cellid)
+
+lsks$clone_fate2 <- lsks$clone_fate
+lsks$clone_fate2[lsks$clone_fate2 == "Monocyte"] <- "Myeloid"
+lsks$clone_fate2[lsks$clone_fate2 == "Neutrophil"] <- "Myeloid"
+lsks$clone_fate2[lsks$clone_fate2 == "Baso"] <- "Myeloid"
+lsks$clone_fate2[lsks$clone_fate2 == "Eos"] <- "Myeloid"
+
+lsks<- SetIdent(lsks,value = "clone_fate2")
+metab <- VlnPlot(lsks,"m_metab1",pt.size = 0,idents = c("Myeloid","Erythroid","Lymphoid","Meg"))
+all <- VlnPlot(lsks,"m_fate1",pt.size = 0.1,idents = c("Myeloid","Erythroid","Lymphoid","Meg"))
+mpp3 <- VlnPlot(lsks,"mpp31",pt.size = 0.1,idents = c("Myeloid","Erythroid","Lymphoid","Meg"))
+
+tiff("weinreb_metab_day2.tiff",
+     width = 6, height = 6, units = 'in', res = 300)
+p <- ggplot(metab$data, aes(x=m_metab1, y=ident,color=ident)) + 
+  geom_boxplot(lwd = 1.5,show.legend = FALSE)
+p + coord_flip() + scale_color_manual(values=c("blue","#999999", "red", "#E69F00")) + theme_classic() +theme(axis.text=element_text(size=12,face = 'bold'),
+        axis.title=element_text(size=0,face="bold"),
+        axis.line = element_line(size = 1.0, colour = "black"))
+
+dev.off()
+
+tiff("weinreb_allgenes_day2.tiff",
+     width = 6, height = 6, units = 'in', res = 300)
+p <- ggplot(all$data, aes(x=m_fate1, y=ident,color=ident)) + 
+  geom_boxplot(lwd = 1.5,show.legend = FALSE)
+p + coord_flip() + scale_color_manual(values=c("blue","#999999", "red", "#E69F00")) + theme_classic() +theme(axis.text=element_text(size=12,face = 'bold'),
+        axis.title=element_text(size=0,face="bold"),
+        axis.line = element_line(size = 1.0, colour = "black"))
+
+
+dev.off()
+
+
+
+tiff("weinreb_mpp3_pia_day2.tiff",
+     width = 6, height = 6, units = 'in', res = 300)
+p <- ggplot(mpp3$data, aes(x=mpp31, y=ident,color=ident)) + 
+  geom_boxplot(lwd = 1.5,show.legend = FALSE)
+p + coord_flip() + scale_color_manual(values=c("blue","#999999", "red", "#E69F00")) + theme_classic() +theme(axis.text=element_text(size=12,face = 'bold'),
+        axis.title=element_text(size=0,face="bold"),
+        axis.line = element_line(size = 1.0, colour = "black"))
+dev.off()
+
+#data are not normal based on shapiro test
+shapiro.test(metab$data$m_metab1)
+shapiro.test(all$data$m_fate1)
+
+pairwise.wilcox.test(metab$data$m_metab1, metab$data$ident,
+                 p.adjust.method = "BH")
+
+pairwise.wilcox.test(all$data$m_fate1, all$data$ident,
+                 p.adjust.method = "BH")
+
+
+
+lsks.filtered.cells <- colnames(lsks)[lsks$clone_fate2 == "Myeloid" | lsks$clone_fate2 == "Erythroid" |
+                                        lsks$clone_fate2 == "Meg" | lsks$clone_fate2 == "Lymphoid"]
+lsks.filtered <- subset(lsks,cells = lsks.filtered.cells )
+
+tiff("weinreb.tiff",
+     width =6, height = 6, units = 'in', res = 300)
+DimPlot(lsks.filtered, reduction = "spring", group.by = "clone_fate2",
+        cols = c( "red","#E69F00","#999999","blue"), pt.size = 0.5) + NoLegend()
+dev.off()
+```
+
+
+#cKit compartment
+Lets see how our signatures look in the Tusi dataset. Tusi et al Nature (2018).
+Tusi et al  comprises 4,763 cKit+ progenitors. To annotate this dataset we performed unsupervised clustering of the data and supervised annotation using lineage-specific markers provided in supplementary table 1 of the original article
+
+```{r Tusi_dataset, echo=FALSE, eval= FALSE}
+
+load("datasets/Tusi/Tusi_seurat_control_only.Rda")
+TusiEPO.control <- AddModuleScore(TusiEPO.control, features = list(m.metab), name = "M_metafate")
+TusiEPO.control <- AddModuleScore(TusiEPO.control, features = list(m.fate), name = "M_fate")
+
+
+tiff("Tusi.tiff",
+     width =6, height = 6, units = 'in', res = 300)
+DimPlot(TusiEPO.control,reduction = "spring", cols = c("red","blue" ,"grey90","grey50","#E69F00"))
+dev.off()
+
+# Define an order of cluster identities
+my_levels <- c("M","MEG","E","L")
+
+# Relevel object@ident
+TusiEPO.control@active.ident <- factor(x = TusiEPO.control@active.ident, levels = my_levels)
+
+sig <- VlnPlot(TusiEPO.control, "M_metafate1", idents = c("L","E","M","MEG"))
+
+shapiro.test(sig$data$M_metafate1)
+pairwise.wilcox.test(sig$data$M_metafate1, sig$data$ident,
+                 p.adjust.method = "BH")
+
+
+tiff("Tusi_VlnPlot.tiff",
+     width =6, height = 6, units = 'in', res = 300)
+p <- ggplot(sig$data, aes(x=M_metafate1, y=ident,color=ident)) + 
+  geom_boxplot(lwd = 1.5,show.legend = FALSE)
+p + coord_flip() + scale_color_manual(values=c("blue","#999999", "red", "#E69F00")) + theme_classic() +theme(axis.text=element_text(size=12,face = 'bold'),
+        axis.title=element_text(size=0,face="bold"),
+        axis.line = element_line(size = 1.0, colour = "black"))
+dev.off()
+
+
+
+sig <- VlnPlot(TusiEPO.control, "M_fate1", idents = c("L","E","M","MEG"))
+
+shapiro.test(sig$data$M_fate1)
+
+
+pairwise.wilcox.test(sig$data$M_fate1, sig$data$ident,
+                 p.adjust.method = "BH")
+
+tiff("Tusi_VlnPlot_allgenes.tiff",
+     width =6, height = 6, units = 'in', res = 300)
+p <- ggplot(sig$data, aes(x=M_fate1, y=ident,color=ident)) + 
+  geom_boxplot(lwd = 1.5,show.legend = FALSE)
+p + coord_flip() + scale_color_manual(values=c("blue","#999999", "red", "#E69F00")) + theme_classic() +theme(axis.text=element_text(size=12,face = 'bold'),
+        axis.title=element_text(size=0,face="bold"),
+        axis.line = element_line(size = 1.0, colour = "black"))
+dev.off()
+
+
+
+tiff("Tusi_metafate.tiff",
+     width =4, height = 6, units = 'in', res = 300)
+FeaturePlot(TusiEPO.control, reduction = "spring", features = "M_metafate1",max.cutoff = "q97", min.cutoff = "q3")
+dev.off()
+
+tiff("Tusi_allgenes.tiff",
+     width =4, height = 6, units = 'in', res = 300)
+FeaturePlot(TusiEPO.control, reduction = "spring", features = "M_fate1",max.cutoff = "q97", min.cutoff = "q3")
+dev.off()
+
+
+
+load("datasets/Tusi/Tusi_seuratObj.Rda")
+
+TusiEPO <- AddModuleScore(TusiEPO, features = list(m.metab), name = "M_metafate")
+TusiEPO <- AddModuleScore(TusiEPO, features = list(m.fate), name = "M_fate")
+
+sig <- VlnPlot(TusiEPO,"M_fate1",group.by = "batch")
+
+p <- ggplot(sig$data, aes(x=M_fate1, y=ident,color=ident)) + 
+     geom_boxplot(lwd = 1.5,show.legend = FALSE)
+
+
+p + coord_flip() + scale_color_manual(values=c("red" ,"#56B4E9" ,"#999999","#E69F00")) + theme_classic() + theme(axis.text=element_text(size=12,face = 'bold'),axis.title=element_text(size=0,face="bold"),
+ axis.line = element_line(size = 1.0, colour = "black"))
+
+
+                                                                                                      
+```
+
+
+
+
+# Dahlin 
+Dahlin et al comprises 44802 cKit+ and cKit+ Sca1+ hematopoietic progenitors38. Cell clustering and supervised assignment of cluster identity were taken from scripts associated with Wolf et al. PAGA paper
+```{r Dahlin, echo=FALSE, eval= FALSE}
+
+load("datasets/Dahlin/Dahlin.Rda")
+
+dahlin  <- AddModuleScore(dahlin, features = list(m.metab), name = "M_metafate")
+dahlin <- AddModuleScore(dahlin, features = list(m.fate), name = "M_fate")
+
+
+tiff("Dahlin.tiff",
+     width =6, height = 6, units = 'in', res = 300)
+DimPlot(dahlin,cols = c("grey90","#E69F00","grey90","red","grey90","blue",
+                        "grey90","grey90","grey60","grey90","grey90")) +NoLegend()
+          
+dev.off()
+
+
+#lets look at key celltypes of interest to make sure our annnotations make sense
+HSC.markers <- c("Procr","Ly6a")
+neu.mo <- c("Ctsg","Mpo","Csf1r","Irf8","Cebpe")
+meg <- c("Itga2b","Pbx1","Sdpr","Vwf","Sdha","F2lr2","Pf4","Selp")
+ery <- c('Gata1', 'Klf1', 'Epor', 'Gypa', 'Hba-a2', 'Hba-a1')
+ly <- c("Cd19","Vpreb2","Cd79a","Il7r","Cd79b")
+mast.baso <- c("Ms4a2","Fcer1a","Cpa3","Gzmb","Mcpt8","Prss34")
+
+FeaturePlot(dahlin , reduction = "umap", features = HSC.markers,
+            max.cutoff = "q95",min.cutoff = "q5")
+
+FeaturePlot(dahlin , reduction = "umap", features = neu.mo,
+            max.cutoff = "q95",min.cutoff = "q5")
+
+FeaturePlot(dahlin , reduction = "umap", features = meg,
+            max.cutoff = "q95",min.cutoff = "q5")
+
+FeaturePlot(dahlin , reduction = "umap", features = ery,
+            max.cutoff = "q95",min.cutoff = "q5")
+
+FeaturePlot(dahlin , reduction = "umap", features = ly,
+            max.cutoff = "q95",min.cutoff = "q5")
+
+FeaturePlot(dahlin , reduction = "umap", features = mast.baso,
+            max.cutoff = "q95",min.cutoff = "q5")
+
+
+
+FeaturePlot(dahlin , reduction = "umap", features = "M_metafate1",
+            max.cutoff = "q95",min.cutoff = "q5")
+
+FeaturePlot(dahlin , reduction = "umap", features = "M_fate1",
+            max.cutoff = "q95",min.cutoff = "q5")
+
+
+
+
+my_levels <- c("M","Mk","E","L")
+
+# Relevel object@ident
+dahlin@active.ident <- factor(x = dahlin@active.ident, levels = my_levels)
+
+
+
+tiff("Dahlin_metafate.tiff",
+     width =6, height = 6, units = 'in', res = 300)
+sig <- VlnPlot(dahlin,"M_metafate1",idents = c("Mk","L","E","M"))
+
+p <- ggplot(sig$data, aes(x=M_metafate1, y=ident,color=ident)) + 
+  geom_boxplot(lwd = 1.5,show.legend = FALSE)
+p + coord_flip() + scale_color_manual(values=c("blue","#999999", "red", "#E69F00")) + theme_classic() +theme(axis.text=element_text(size=12,face = 'bold'),
+        axis.title=element_text(size=0,face="bold"),
+        axis.line = element_line(size = 1.0, colour = "black"))
+dev.off()
+
+
+
+sig <- VlnPlot(dahlin, "M_metafate1", idents = c("L","E","M","Mk"))
+
+
+
+pairwise.wilcox.test(sig$data$M_metafate1, sig$data$ident,
+                 p.adjust.method = "BH")
+
+
+tiff("Dahlin_fate.tiff",
+     width =6, height = 6, units = 'in', res = 300)
+sig <- VlnPlot(dahlin,"M_metafate1",idents = c("Mk","L","E","M"))
+
+
+pairwise.wilcox.test(sig$data$M_metafate1, sig$data$ident,
+                 p.adjust.method = "BH")
+
+
+p <- ggplot(sig$data, aes(x=M_metafate1, y=ident,color=ident)) + 
+  geom_boxplot(lwd = 1.5,show.legend = FALSE)
+p + coord_flip() + scale_color_manual(values=c("blue","#999999", "red", "#E69F00")) + theme_classic() +theme(axis.text=element_text(size=12,face = 'bold'),
+        axis.title=element_text(size=0,face="bold"),
+        axis.line = element_line(size = 1.0, colour = "black"))
+
+dev.off()
+
+
+```
+
+
+
+
+
+
+
+```{r INFECTION, echo=FALSE, eval= FALSE}
+
+setwd('/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/JCB16_LoCelso_Plasmodium_Infection/wetransfer-2a31f3')
+
+data.combined <- readRDS('processed_dataset_LoCelso.rds')
+
+
+# Run the standard workflow for visualization and clustering
+data.combined <- ScaleData(data.combined, verbose = FALSE)
+data.combined <- RunPCA(data.combined, npcs = 30, verbose = FALSE)
+ElbowPlot(data.combined,ndims = 12)
+DimPlot(data.combined,group.by = "clusters",dims = c(1,2), 
+        cols = c("grey","grey","grey","grey","grey","grey","grey"))
+
+
+data.combined <- AddModuleScore(data.combined, features =  list(m.metab),
+                                name = "m_metab",assay = "RNA")
+
+data.combined <- AddModuleScore(data.combined, features =  list(m.fate),
+                                name = "m_fate",assay = "RNA")
+
+DefaultAssay(dataset.integrated) <- "RNA"
+tiff("/Users/jasoncosgrove/Desktop/meta_fate.tiff",
+     width =6, height = 6, units = 'in', res = 300)
+FeaturePlot(data.combined, features = c("m_metab1"),max.cutoff = "q95", min.cutoff = "q5", cols = c("grey90","black") ,ncol = 1)
+dev.off()
+
+
+FeaturePlot(data.combined, features = "Sell",max.cutoff = "q95", min.cutoff = "q5", cols = c("black","red") )
+
+VlnPlot(data.combined,"m_metab1",group.by = "condition",pt.size = 0)
+
+
+hspc.cells <- rownames(data.combined@meta.data)[data.combined$clusters == "4 Primitive HSPC"]
+hspc <- subset(data.combined, cells = hspc.cells)
+
+hspc <- AddModuleScore(hspc, features =  list(m.metab),
+                                name = "m_metab",assay = "RNA")
+
+VlnPlot(hspc,"m_metab1",group.by = "condition",pt.size = 0,assay = "RNA",adjust = 0.9)
+VlnPlot(hspc,"Sell",group.by = "condition",pt.size = 1, assay = "RNA")
+
+
+hspc <- AddModuleScore(hspc, features =  list(m.fate),
+                                name = "m_fate",assay = "RNA")
+
+VlnPlot(hspc,"m_fate1",group.by = "condition",pt.size = 0,assay = "RNA",adjust = 0.9)
+
+
+saveRDS(data.combined, "processed_dataset_LoCelso.rds")
+
+df <- VlnPlot(hspc,"m_metab1",group.by = "condition",pt.size = 1,assay = "RNA")
+
+write.csv(df$data,"/Users/jasoncosgrove/Desktop/metafate_hspcs.csv")
+
+```
+
+
+
+
