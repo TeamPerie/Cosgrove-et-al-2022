@@ -1,0 +1,414 @@
+---
+title: "lenti_analysis"
+author: "Jason Cosgrove"
+date: "19/10/2021"
+output: html_document
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/JCW19_LENTI_BARCODING/Data_analysis/results/outputs _QC_and_preprocessing/outputs_for_Analysis/")
+
+
+
+
+
+#clear the workspace and load in the necessary packages
+rm(list = ls())
+library(cowplot)
+library(plotrix)
+library(ggplot2)
+
+
+# Set output directory
+output_fp <- "/Users/jasoncosgrove/Desktop/"
+
+```
+
+
+```{r helperMethods, include=FALSE}
+
+
+# remove clones where both the cd62lneg and the cd62lhigh columns are zero
+# mat is the normalised barcode expression matrix
+# pos/neg.column are the names of the cd62l population columns
+# returns the matrix 'mat', minus the barcodes which are not 
+# expressed in either of the cd62l populations
+removeUninformativeClones <- function(mat, pos.column, neg.column){
+      #remove any rows where both pos and neg are zero
+    m.filtered <- mat[(mat[,neg.column] > 0 | mat[,pos.column] > 0),]
+
+    return(m.filtered)
+}
+
+
+# get the column names for a specific mouse samples
+# mouse.id the specific mouse that you want to analyse
+# returns a list of column names
+getColumnNames <- function(mouse.id){
+    
+    #access the columns we want for the analysis
+    m.column <- paste(mouse.id,"_TERNEG_m",sep = "")
+    e.column <- paste(mouse.id,"_TERPOS_e",sep = "")
+    b.column <- paste(mouse.id,"_TERNEG_b",sep = "")
+    neg.column <- paste(mouse.id,"_CKITPOS_cd62lneg",sep = "")
+    pos.column <- paste(mouse.id,"_CKITPOS_cd62lpos",sep = "")
+    mk.column <- paste(mouse.id,"_CKITPOS_mkp",sep = "")
+    mp.column <- paste(mouse.id,"_CKITPOS_mp",sep = "")
+            
+    return(list(m.column = m.column,  e.column = e.column, b.column = b.column,
+                neg.column = neg.column, pos.column = pos.column,
+                mk.column = mk.column , mp.column = mp.column))
+}
+
+#generate a dataframe with the log10 read counts of each barcode in a given sample, as well as the cumulative probability
+# of finding a barcode with a given number of reads in that sample
+# barcode matrix is a barcode expression matrix
+# sample is a string with the sample you want ot analyse
+generateCumulativeProbability <- function(barcodematrix,sample){
+
+  #renormalise the clones to 1 for the myeloid lineage
+  barcodematrix$data.normalised <- barcodematrix[,sample] / sum(barcodematrix[,sample])
+  
+  #rank each clone in terms of normalised abundance
+  data.ranked <- barcodematrix[order(barcodematrix$data.normalised),]
+  
+  output <- data.frame(cbind(log10(data.ranked[,sample] + 1),cumsum(data.ranked$data.normalised)))
+  colnames(output) <- c("read_counts","cumsum")
+  return(output)
+
+}
+
+
+# the results of the generateCumulativeProbability method and send the plots to output_fp
+plotCumulativeProb <- function(m.both,m.pos,m.neg,sample,output_fp){
+
+    shared <- generateCumulativeProbability(m.both,sample)
+    pos <- generateCumulativeProbability(m.pos,sample)
+    neg <- generateCumulativeProbability(m.neg,sample)
+    
+    fp <- paste(output_fp,sample,"_cumulative_prob",".tiff",sep = "")
+    #tiff(fp,units="in", width=12, height=10, res=300) 
+    plot(shared$read_counts,shared$cumsum,col = "grey",lwd = 6,type = "l")
+    
+    lines(neg$read_counts,neg$cumsum,col = "red",lwd = 6)
+    lines(pos$read_counts,pos$cumsum,col = "blue",lwd = 6)
+    #dev.off()
+
+}
+
+
+
+# get the barcode expression matrix for a single mouse
+# mat is the barcode expression matrix
+# mouse.id is the mouse you want to analyse
+getMouseMatrix <- function(mat, mouse.id){
+      mouse.columns <- colnames(mat)[grepl(mouse.id,colnames(mat))]
+    mouse <- data.frame(mat[,c("tag",mouse.columns,"shared")])
+    
+    colnames <- getColumnNames(mouse.id)
+    
+    m <- removeUninformativeClones(mouse, colnames$pos.column, colnames$neg.column)
+    return(m)
+}
+
+# plot the normalised read abundance for 2 samples and indicate the spearmans correlation score
+# mat is the normalised barcode expression amtrix
+# column1/2 the column of the matrix you want to plot
+# celltype1/2 the names of the samples you are plotting
+correlationPlot <- function(mat,column1, column2,celltype1, celltype2){
+  
+  corr.score <- round(cor(mat[,column1] ,mat[,column2],method = "spearman"),2)  
+  plot.title <- paste( celltype1," vs ", celltype2,"\n spearmans: ",corr.score)
+  p <- qplot(log(mat[,column1] + 1),log(mat[,column2] + 1),col = mat$shared,
+       main = plot.title) + geom_abline(intercept = 0,slope = 1, col = 'grey30')
+       
+  return(p)
+}
+
+
+
+# plot the different comparisons that we are interested in, 
+# and colour the point based on whether it occurs across several mice or not
+# mat is the barcode expression matrix
+#mouse id is the mouse you want to look at
+#fp this is the directory where you want to send the plots
+plotCorrelations <- function(mat,mouse.id, fp = output_fp){
+  
+  m <- getMouseMatrix(mat, mouse.id)
+  
+  colnames <- getColumnNames(mouse.id)
+  
+ # jpeg(paste(fp,mouse.id,".jpg"))
+  
+  p1 <- correlationPlot(m,colnames$e.column, colnames$m.column, 
+                        "erythroid", "myeloid")
+  
+  p2 <- correlationPlot(m,colnames$b.column, colnames$m.column, 
+                        "B", "myeloid")
+  
+  p3 <- correlationPlot(m,colnames$mk.column, colnames$m.column, 
+                        "Mk", "myeloid")
+  
+  p4 <- correlationPlot(m,colnames$pos.column, colnames$neg.column, 
+                        "cd62lpos", "cd62lneg")
+  
+
+   print(plot_grid(p1,p2,p3,p4,
+          ncol = 1, nrow =4))
+   # dev.off()
+    
+   # jpeg(paste(fp,mouse.id,"_SELLPOS.jpg"), width = 480, height = 720)
+
+    
+      p5 <- correlationPlot(m,colnames$pos.column, colnames$m.column, 
+                        "cd62lpos", "myeloid")
+      
+      p6 <- correlationPlot(m,colnames$pos.column, colnames$e.column, 
+                        "cd62lpos", "erythroid")
+       
+      p7 <- correlationPlot(m,colnames$pos.column, colnames$b.column, 
+                        "cd62lpos", "B")
+        
+      p8 <- correlationPlot(m,colnames$pos.column, colnames$mk.column, 
+                        "cd62lpos", "Mk")
+      
+      p9 <- correlationPlot(m,colnames$pos.column, colnames$mp.column, 
+                        "cd62lpos", "MP")
+    
+    
+       print(plot_grid(p5,p6,p7,p8, p9,
+          ncol = 1, nrow =5))
+  
+    
+   # dev.off()
+    
+     #   jpeg(paste(fp,mouse.id,"_SELLNEG.jpg"),  width = 480, height = 720)
+
+    
+      p10 <- correlationPlot(m,colnames$neg.column, colnames$m.column, 
+                        "cd62lneg", "myeloid")
+      
+      p11 <- correlationPlot(m,colnames$neg.column, colnames$e.column, 
+                        "cd62lneg", "erythroid")
+       
+      p12 <- correlationPlot(m,colnames$neg.column, colnames$b.column, 
+                        "cd62lneg", "B")
+        
+      p13 <- correlationPlot(m,colnames$neg.column, colnames$mk.column, 
+                        "cd62lneg", "Mk")
+      
+      p14 <- correlationPlot(m,colnames$neg.column, colnames$mp.column, 
+                        "cd62lneg", "MP")
+    
+    
+       print(plot_grid(p10,p11,p12,p13, p14,
+          ncol = 1, nrow =5))
+    
+    #dev.off()
+
+ 
+}
+
+# set a new parameter bias stating whether its a cd62lpos or cd62l neg clone. Cells with non zero expression in both samples are considered unbiased
+setCloneBias <- function(supermouse){
+  supermouse$bias <- rep('None',nrow(supermouse))
+  supermouse$bias[which(supermouse$cd62lpos == 0)] <- "cd62lneg"
+  supermouse$bias[which(supermouse$cd62lneg == 0)] <- "cd62lpos"
+  return(supermouse)
+}
+
+#To perform a ternary plot we need to normalise across rows. Prior to row normalisation each value represents the relative abundance of each barcode in each sample. When we do the row normalisation the values represent the bias per clone, i.e. relative abundance of a single barcode across the lineages scaled between 0 and 1. 
+# matrix: normalised barcode matrix
+performRowNormalisation <- function(matrix){
+  for(i in 1:nrow(matrix)){
+      if(rowSums(matrix[i,c("B","M","E")]) > 0){
+              matrix[i,c("B","M","E")] <-   
+                matrix[i,c("B","M","E")]/sum(matrix[i,c("B","M","E")])
+       }
+     }
+  return(matrix)
+}
+
+
+## assess which barcodes are shared across different mice by reading in files from the step2 preprocessing script. 
+#nosharing_fp: the .csv file detailing all clones that are not shared across mice, this file is generated by the step2_QCandPreprocessing.Rmd script
+#final.mat: the QC'd barcode expression matrix
+# returns a barcode expression matrix with an additional column 'shared' saying TRUE if the barcode is found across multiple mice
+calculateBarcodeSharing <- function(nosharing_fp, final.mat){
+
+    final.mat.nosharing <- read.csv(nosharing_fp)
+    shared.bcs <- setdiff(final.mat$tag, final.mat.nosharing$tag)
+    final.mat$shared <- final.mat$tag %in% shared.bcs
+    return(final.mat)
+}
+
+
+#combine the expression matrices for each single mouse into a single metamouse sample
+# so we have increased statistical power to look at rare barcodes. 
+makeMetaMouse <- function(final.mat){
+
+  #get the expression matrix for each mouse
+  m1 <- getMouseMatrix(final.mat,'STB13_1')
+  m2 <- getMouseMatrix(final.mat,'STB13_3')
+  m3 <- getMouseMatrix(final.mat,'STB13_5')
+  m4 <- getMouseMatrix(final.mat,'STB13_6')
+  
+  #rename the barcodes to make sure that shared barcodes 
+  #between mice get treated as separate clones
+  m1$tag <- paste("m1_",m1$tag,sep = "")
+  m2$tag <- paste("m2_",m2$tag,sep = "")
+  m3$tag <- paste("m3_",m3$tag,sep = "")
+  m4$tag <- paste("m4_",m4$tag,sep = "")
+  
+  #rename columns so they are consistent across datasets
+  colnames(m1) <- c("tag","cd62lneg","cd62lpos","mkp","mp","B","M","E","shared")
+  colnames(m2) <- c("tag","cd62lneg","cd62lpos","mkp","mp","B","M","E","shared")
+  colnames(m3) <- c("tag","cd62lneg","cd62lpos","mkp","mp","B","M","E","shared")
+  colnames(m4) <- c("tag","cd62lneg","cd62lpos","mkp","mp","B","M","E","shared")
+  
+  #now make an integrated sample with all mice
+  supermouse <- rbind(m1, m2,m3,m4)
+  
+  #clones must be in either the pos or the neg
+  supermouse <- supermouse[(supermouse$cd62lpos > 0 | supermouse$cd62lneg > 0),]
+}
+
+
+```
+
+
+```{r readData, include=TRUE}
+#read in the QC'd, filtered and normalised matrix from Louisa
+#taken from the outputs_for_Analysis folder and the filename was
+# STB13_L400_ANALYSIS_matx_norm_filt_cor_ab_trueFalseRU.csv
+final.mat <- read.csv("STB13_L400_ANALYSIS_matx_norm_filt_cor_ab.csv")
+
+#see which barcodes have been shared between mice and store this information in the shared column of final.mat
+final.mat <- calculateBarcodeSharing("STB13_L400_ANALYSIS_matx_norm_filt_cor_ab_trueFalseRU.csv", final.mat)
+
+
+```
+
+
+
+
+```{r assessBarcodeSharingAcrossMice, include=FALSE}
+
+# generate correlation plots for all of the different sample comparisons, 
+# highlighting which barcodes are shared across mice
+plotCorrelations(final.mat,"STB13_1")
+plotCorrelations(final.mat,"STB13_3")
+plotCorrelations(final.mat,"STB13_5")
+plotCorrelations(final.mat,"STB13_6")
+
+
+```
+```{r downstreamAnalysis, include=TRUE}
+
+# merge the different mice into a single sample
+supermouse<- makeMetaMouse(final.mat)
+
+```
+
+```{r setBias, include=TRUE}
+
+#set a new parameter bias stating whether its a cd62lpos or cd62l neg clone
+supermouse <- setCloneBias(supermouse)
+
+#plot the read abundances in the cd62l samples higlighting the bias state of each barcode
+#fp <- paste(output_fp,"clonebias.tiff",sep="")
+#tiff(fp,units="in", width=6, height=3, res=300) 
+qplot(log(supermouse$cd62lneg+ 1) ,log(supermouse$cd62lpos + 1),col = supermouse$bias) + geom_abline(intercept = 0,slope = 1, col = 'grey30') + scale_color_manual(values=c("red", "blue","grey60"))   +  geom_point(size=2)
+#dev.off()
+
+#subset the different clones based on their bias state
+supermouse.pos <- supermouse[supermouse$bias == "cd62lpos",]
+supermouse.neg <- supermouse[supermouse$bias == "cd62lneg",]
+supermouse.not_shared <- supermouse[supermouse$bias != "None",]
+
+```
+
+```{r heatmap, include=TRUE}
+#the filepath for where you want to save your results. 
+#fp <- paste(output_fp,"heatmap.tiff",sep = "")
+#run an unsupervised clustering of the data and plot the results as a heatmap
+#tiff(fp,units="in", width=10, height=10, res=300) 
+heatmap(log(as.matrix(supermouse.not_shared[,c(2,3,7)] + 1)) ,col=colorRampPalette(c("black","green","red"),bias = 2)(300),scale = "none",distfun = function(x) dist(x,method = 'euclidean'))
+#dev.off()
+
+
+```
+
+
+```{r ternaryPlot, include=TRUE}
+
+#copy the supermouse datasets
+supermouse.temp <- supermouse
+
+
+#so previosuly we normalise by column which gives us the fractional representation per lineage, a normalisation that can adjust for the different sizes of the mature compartments. Now we normalise within each clone (row normalisation). SO here you are asking per clone if i contribute to 10% of all E clones, 10% of all B clones and 20% M, then you would have a bias score of 0.25,0.25 and 0.5 for E,B, and M
+supermouse.temp<- performRowNormalisation(supermouse.temp)
+
+#subset the different clones based on their bias state,and we only want the E,M, and B columns
+supermouse.temp.pos <- supermouse.temp[supermouse.temp$bias == "cd62lpos",c("E","M","B")]
+supermouse.temp.neg <- supermouse.temp[supermouse.temp$bias == "cd62lneg",c("E","M","B")]
+supermouse.temp.not_shared <- supermouse.temp[supermouse.temp$bias != "None",c("E","M","B")]
+supermouse.temp.shared <- supermouse.temp[supermouse.temp$bias == "None",c("E","M","B")]
+
+
+#remove clones with no detectable output in the mature lineages
+supermouse.temp.shared <- supermouse.temp.shared[rowSums(supermouse.temp.shared) > 0,]
+supermouse.temp.pos <- supermouse.temp.pos[rowSums(supermouse.temp.pos) > 0,]
+supermouse.temp.neg <- supermouse.temp.neg[rowSums(supermouse.temp.neg) > 0,]
+
+
+#the filepath for where you want to save your results. 
+#fp <- paste(output_fp,"ternary.tiff",sep = "")
+#run an unsupervised clustering of the data and plot the results as a heatmap
+#tiff(fp,units="in", width=10, height=10, res=300) 
+
+triax.plot(supermouse.temp.shared, col.symbols = "grey80",show.grid = F,pch = 16)
+
+triax.points(supermouse.temp.neg,col.symbols = rgb(red = 1, green = 0, blue = 0, alpha = 0.5),show.grid = F,pch = 16,cex = 2)
+triax.points(supermouse.temp.pos, col.symbols = rgb(red = 0, green = 0, blue = 1, alpha = 0.5),pch = 16,cex = 2)
+
+#dev.off()
+
+
+```
+
+
+
+```{r CumulativeProbability, include=TRUE}
+
+m <- supermouse
+
+#get total reads across all cells
+m$allsamples <- rowSums(m[,2:3])
+
+
+#subset the different clones based on their bias state
+m.pos <- m[m$bias == "cd62lpos",]
+m.neg <- m[m$bias == "cd62lneg",]
+m.both <- m[m$bias == "None",]
+
+plotCumulativeProb(m.both, m.pos,m.neg,"cd62lpos",output_fp)
+plotCumulativeProb(m.both, m.pos,m.neg,"cd62lneg",output_fp)
+plotCumulativeProb(m.both, m.pos,m.neg,"M",output_fp)
+plotCumulativeProb(m.both, m.pos,m.neg,"B",output_fp)
+plotCumulativeProb(m.both, m.pos,m.neg,"E",output_fp)
+plotCumulativeProb(m.both, m.pos,m.neg,"allsamples",output_fp)
+
+#also plot the cumulative probabilities for the cd62lpos and cd62lneg samples
+#fp <- paste("/Users/jasoncosgrove/Desktop/","pos_vs_neg","_cumulative_prob",".tiff",sep = "")
+#tiff(fp,units="in", width=12, height=10, res=300) 
+pos <- generateCumulativeProbability(m.pos,"cd62lpos")
+neg <- generateCumulativeProbability(m.neg,"cd62lneg")
+plot(pos$read_counts,pos$cumsum,col = "blue",lwd = 6,type = "l")
+lines(neg$read_counts,neg$cumsum,col = "red",lwd = 6)
+#dev.off()
+
+
+
+```

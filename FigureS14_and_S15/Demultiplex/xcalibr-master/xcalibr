@@ -1,0 +1,26 @@
+#!/bin/bash
+
+P=$1
+shift
+BINPATH=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+
+case "$P" in
+"hash")
+	$BINPATH/bin/hashreads $@
+;;
+"analyze")
+	$BINPATH/bin/analyzehash $@
+;;
+"extract")
+	$BINPATH/bin/extracthash $@
+;;
+"reduce")
+	$BINPATH/bin/reducecounts $@
+;;
+*)
+	echo "Usage"
+	echo "   xcalibr <function>"
+	echo "   Function is hash, analyze, extract or reduce. Use -h per tool for more help"
+;;
+esac
+

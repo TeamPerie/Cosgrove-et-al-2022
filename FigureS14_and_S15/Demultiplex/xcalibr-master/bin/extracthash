@@ -1,0 +1,219 @@
+#!/usr/bin/env perl 
+
+use strict;
+use warnings;
+
+use 5.010;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Xcalibr;
+use Pod::Usage;
+use Getopt::Long;
+use Storable;
+
+use Data::Dumper;
+
+my $debug;
+my $printzero;
+my $t;
+my $sf;
+my $split = {rows=>'_y', cols=>'_x', splitby=>'_z'};
+my $reltoseq;
+my $reqseq;
+my $savesettings;
+my $references = {X=>undef, Y=>undef, Z=>undef};
+my $printall = {X=>undef, Y=>undef, Z=>undef};
+my $printempty = {X=>undef, Y=>undef, Z=>undef};
+my $mismatches = {X=>undef, Y=>undef, Z=>undef};
+my $sparse;
+my $output;
+my $help;
+my $man;
+
+GetOptions(
+    "help|h"     => \$help,
+    "debug"          => \$debug,
+    "manual|man"     => \$man,
+    "template:s"     => \$t,
+    "settingsfile:s" => \$sf,
+    "rows:s"         => \$split->{rows},
+    "cols:s"         => \$split->{cols},
+    "splitby:s"      => \$split->{splitby},
+    "relative"       => \$reltoseq,
+    "requireseq"     => \$reqseq,
+    "savesettings:s" => \$savesettings,
+    "matchX:s"       => \$references->{X},
+    "matchY:s"       => \$references->{Y},
+    "matchZ:s"       => \$references->{Z},
+    "printallX"    => \$printall->{X},
+    "printallY"    => \$printall->{Y},
+    "printallZ"    => \$printall->{Z},
+    "printemptyX"    => \$printempty->{X},
+    "printemptyY"    => \$printempty->{Y},
+    "printemptyZ"    => \$printempty->{Z},
+    "mismatchesX"       => \$mismatches->{X},
+    "mismatchesY"       => \$mismatches->{Y},
+    "mismatchesZ"       => \$mismatches->{Z},
+	"sparse"       => \$sparse,
+	"output:s"       => \$output
+) or pod2usage(2);
+pod2usage(1) if $help;
+
+#the remaining argument is the file to process
+my $hashfile = shift or pod2usage(2);
+
+#########
+## Parse and check all the remaining command line data
+#########
+
+die "File $hashfile not found" unless -e $hashfile;
+
+#either template from command line or file is required
+if(($t && $sf) || (!$t && !$sf)) {
+	die "Use either template or settings file\n";
+}
+
+#check rows/cols/splits (only XYZ allowed) and no duplicates
+my %used;
+foreach my $key (keys %$split) {
+	$used{$key}++;
+	next if $split->{$key} =~ /_[xyz]/; #skip default values;
+	die "Can only assign a target to one action (rows/cols/splitby) $key used twice" if $used{$key} > 1;
+	die "Split value for $key should be either X,Y or Z" unless $split->{$key} =~ /^[XYZ]{1}$/;
+}
+
+#relative implies requireseq because it uses a search to position the template
+if ($reltoseq && not defined $reqseq) {
+	print STDERR "Use of --relative implies --requireseq (added)\n";
+}
+
+#read from settings file
+if($sf) {
+	die "Settings file requires Config::Auto as a dependency" unless eval("require Config::Auto"); 
+	open(T,"<", $sf) or die "File error:$!\n";
+	$t = <T>;
+	chomp $t;
+	close(T);
+	die "Not implemented";
+}
+
+my $settings = {split=>$split, references=>$references, printall=>$printall, printempty=>$printempty, reltoseq=>$reltoseq, requireseq=>$reqseq};
+
+my $x = Xcalibr->new($settings);
+
+#parse the template
+$x->parse_template($t);
+
+print STDERR Dumper($x) if $debug;
+
+#do some magic on the splits
+my %tusage  = (rows=>3, cols=>2, splitby=>1);
+my %usedtpl =  map { exists $x->{template}->{$_} ? ($_=>$x->{template}->{$_}->{length}) : ()} qw/X Y Z/;
+#take out assigned
+foreach my $t (keys %$split) {
+	next if $split->{$t} =~ /_[xyz]/; #skip default values
+	say STDERR "Assinging $t to $split->{$t}";
+	delete $usedtpl{$split->{$t}};
+	delete $tusage{$t};
+}
+#loop over remaining template letters and 
+my @toassign = sort { $tusage{$a} <=> $tusage{$b} } keys %tusage;
+#remove unwanted elements
+shift @toassign for 1 .. (scalar(keys(%tusage)) - scalar(keys(%usedtpl)));
+for my $t (sort { $usedtpl{$a} <=> $usedtpl{$b} } keys %usedtpl) {
+	my $next = shift @toassign;
+	say STDERR "Auto-assigned $t to $next (based on $t length in template)";
+	$split->{$next} = $t; #because the hashref sits in $x this just works (but is ugly)
+}
+if (exists($x->{template}->{$split->{splitby}}) && defined($mismatches->{$split->{splitby}})) {
+	die "Don't use --mismatches and --splitby for same X, Y or Z";
+}
+
+#add the ref files
+$x->add_references($references, $mismatches);
+
+#if splitby is set --output is required
+die "Need --output (as prefix) when using split functionality\n" if exists $x->{template}->{$split->{splitby}} && not defined $output;
+
+#load hashed sequence data
+my $data = retrieve($hashfile);
+
+my $counts = $x->count_hash($data);
+
+if($sparse) {
+	$x->write_sparse($output);
+} else {
+	$x->write_tables($output);
+}
+$x->print_stats;
+
+exit;
+
+__END__
+=head1 NAME
+
+xcalibr extractt is the workhorse of the Xcalibr package.  It matches one or
+more reference files using the template sequence to the hashed read structure. 
+
+=head1 SYNOPSIS
+
+xcalibr extract --template X6N15Y15 <hashedreads.bin>
+
+Options:
+
+    --help          This message
+    --manual|man    The perldoc
+
+    --template      The read template with XYZ as placedholders e.g. X6CAGGCGCTTAGGATCCY15
+
+    --settingsfile  <NOT YET IMPLEMENTED>
+    --savesettings  <NOT YET IMPLEMENTED>
+
+    --rows          Use X,Y or Z as rows in the result table,
+    --cols          Use X,Y or Z as columns in the result table, 
+    --splitby       Use X,Y or Z to split into multiple output files
+
+    --relative      Match relative to the constant part in the template
+    --requireseq    Require the constant part in the reads (exact match)
+
+    --matchX        Provide reference fasta file for X in template
+    --matchY        Provide reference fasta file for Y in template
+    --matchZ        Provide reference fasta file for Z in template
+
+    --printemptyX   Print barcode from reference X that have no counts in data
+    --printemptyY   Print barcode from reference Y that have no counts in data
+    --printemptyZ   Print barcode from reference Z that have no counts in data
+
+    --printallX     Print barcodes that have no match in the reference file for X
+    --printallY     Print barcodes that have no match in the reference file for Y
+    --printallZ     Print barcodes that have no match in the reference file for Z
+
+    --mismatchesX   Allow one mismatch in provided for each barcode in reference fasta file X
+    --mismatchesY   Allow one mismatch in provided for each barcode in reference fasta file Y
+    --mismatchesZ   Allow one mismatch in provided for each barcode in reference fasta file Z
+
+    --output        Provide the output filename (or prefix when --splitby is used)
+
+=head1 DESCRIPTION
+
+B<xcalibr extract> will read a the hashed read structure and match the the reference provided on the command
+line. If a single table is produced the output can be written to stdout. If multiple tables are 
+generated (by using --splitby) --output specifies the output prefix.
+
+Reference sets are provided as FASTA files using the --matchX --matchY or --matchZ options.
+
+You can arbitrarily assign a template (X,Y,or Z) to the output's rows/columns or splitby.
+
+If youre template has a fixed sequence you can use this to anchor the extraction of the barcodes using the
+--relative flag. If no match to the fixed sequence is found the default coordinates from the template will 
+be used unless --requireseq is used and the read will be skipped
+
+The 3 --printall flags turn the printing of barcodes that do not match anything in the reference on
+
+The --printempty flags prints all the entries in the reference file, even if no hit is found in the data
+
+=cut
+
+
+

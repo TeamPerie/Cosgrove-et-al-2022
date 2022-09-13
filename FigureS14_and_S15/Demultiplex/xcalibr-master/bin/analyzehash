@@ -1,0 +1,77 @@
+#!/usr/bin/env perl 
+
+use strict;
+use warnings;
+
+use Pod::Usage;
+use Getopt::Long;
+use Storable;
+
+my $n = 10;
+my $help;
+
+GetOptions("number|n:i"=>\$n, "help|h"=>\$help) or pod2usage(2);
+pod2usage(1) if $help;
+
+my $hashfile = shift;
+my $region = shift;
+
+pod2usage(2) unless defined $hashfile;
+
+$n--;
+
+#choose some default region
+$region = "1-50" unless defined $region;
+
+die "Hash file not found\n" unless -e $hashfile;
+die "Unparsable region $region\n" unless $region =~ m/(\d+)-(\d+)/;
+
+my $start = $1-1;
+my $length = $2 - $1 + 1;
+
+die "Invalid region $region" unless $start >=0 && $length > 0;
+
+my $data = retrieve($hashfile);
+
+my %barcodehash;
+$barcodehash{substr($_ ,$start,$length)}+= $data->{$_} foreach keys %$data;
+
+my $distinct = scalar keys %barcodehash;
+my $total = 0;
+$total += $_ foreach values %barcodehash;
+print "Found $distinct distinct barcodes\n";
+my @s = sort {$barcodehash{$b} <=> $barcodehash{$a}} keys %barcodehash;
+
+#check if n elements are present?
+$n = $#s if $n > $#s;
+
+#print table
+print "barcode", " "x($length-1), join("\t", qw/count percentage/),"\n";
+print join("\t",$s[$_], $barcodehash{$s[$_]}, sprintf("%.2f",substr($barcodehash{$s[$_]}/$total*100,0,4)) ), "\n" foreach 0 .. $n;
+
+
+__END__
+=head1 NAME
+
+analyzehash - read a hashed set of reads and show the top occurring sequences
+
+=head1 SYNOPSIS
+
+analyzehash [--number 10] <hashfile> <pattern>
+
+Pattern should specify a range of bases like 1-6
+
+Options:
+
+	--help      this message
+
+	--number n  The maximum number of sequences to report (default=10)
+
+=head1 DESCRIPTION
+
+B<analyzehash> will read the hashed representation of the sequences and analyze the
+range specified on the command line. It will sort and print the top occurring sequences in that range.
+
+=cut
+
+

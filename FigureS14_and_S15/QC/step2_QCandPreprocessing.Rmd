@@ -1,0 +1,515 @@
+---
+title: "barcode_QC"
+author: "Louisa Hadj Abed & Jason Cosgrove"
+date: "6/23/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+rm(list = ls())
+#load packages
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(gplots)
+library(gridExtra)
+library(scales)
+library(stringr)
+library(tidyr)
+
+```
+
+
+```{r , echo=FALSE}
+# set working directory
+setwd("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/JCW19_LENTI_BARCODING/Data_analysis/results/outputs_demultiplexing/")
+# import files
+count_matrix <- read.csv("CountMatrix_L400.csv", sep = ",")
+metadata <- read.csv("duplicats_metadata.csv")
+```
+
+# QC analysis of samples
+
+
+```{r, echo=FALSE}
+#format the matrix to facilitate downstream analysis
+makeSampleMatrix <- function(mat,meta){
+    # Total reads per sample
+    sample_readSum <- cbind(colnames(mat),colSums(mat))
+    sample_readSum <- as.data.frame(sample_readSum)
+    names(sample_readSum) <- c("name", "total_read") 
+    
+    
+    ###  1.1 split the identifier column
+    sample_readSum <- cbind(sample_readSum, ldply(strsplit(as.character(sample_readSum$name), "_"), identity) )
+    names(sample_readSum) <- c("ID","total_read",colnames(meta)) #give name to categories
+    
+    ### 1.2 split a & b per sample
+    #data of rep a
+    samples_a <- sample_readSum[which(sample_readSum$duplicats == 'a'),]
+    samples_a <- select(samples_a, -c("duplicats", "ID"))
+    row.names(samples_a) <- NULL #delete the name of the row
+    dimnames(samples_a) [[2]][1] <- "suma" #rename the colonn var en vara
+    #idem with b
+    samples_b <- sample_readSum[which(sample_readSum$duplicats == 'b'),]
+    samples_b <- select(samples_b, -c("duplicats", "ID"))
+    row.names(samples_b) <- NULL
+    dimnames(samples_b) [[2]][1]<- "sumb"
+    
+    samples_ab <- merge(samples_a,samples_b, all=T) #create one table with a and b on the same row
+    samples_ab[is.na(samples_ab)]<-0 #delete na
+    
+    unfactor <-function(df) as.numeric(as.character(unlist(df)))
+    samples_ab$suma <- unfactor(samples_ab$suma)
+    samples_ab$sumb <- unfactor(samples_ab$sumb)   
+    
+    samples_ab$total_read <- apply(select(samples_ab, c("suma", "sumb")), 1, sum)
+    
+    return(samples_ab)
+}
+
+colToRowNames<-function(mat){
+  rownames(mat)<-mat[,1]
+  mat<-mat[,-1]
+  return(mat)
+}
+
+#calculate the a/b ratio and average read count for each sample
+calculateQCMetrics <- function(mat){
+    # ratio
+    mat$ratio <- apply(select(samples_ab, c("suma", "sumb")), 1, max)
+    mat$ratio <- mat$ratio/(apply(select(samples_ab, c("suma", "sumb")), 1, min))
+    # mean
+    mat$mean <- apply(select(samples_ab, c("suma", "sumb")), 1, mean)
+    
+    return(mat)
+}
+
+```
+
+# I-1.  Calculate a/b ratio and average read count
+```{r , echo=FALSE, warning=FALSE}
+#format the matrix for downstream analysis
+matx<-colToRowNames(count_matrix)
+    
+samples_ab <- makeSampleMatrix(matx, metadata)
+# Calculate a/b ratio, proportion of the smaller duplicat on the total read and average read count
+samples_ab <- calculateQCMetrics(samples_ab)
+
+```
+
+# I-1.a. Plot the total number of reads and a/b ratio per sample
+
+```{r, echo=FALSE, warning=FALSE}
+#make an id for each sample to facilitate plotting
+samples_ab$sampleID <- apply(select(samples_ab, colnames(select(metadata, -c("duplicats"))) ), 1, function(x) { paste(x, collapse= "_") } )
+
+
+# Plot total number of reads
+ggplot(data=samples_ab, aes(x=sampleID, y=total_read)) +
+  geom_bar(stat = "identity") +
+  xlab("Mouse") +
+  ylab("Nb reads") +
+  theme(axis.text=element_text(size=10,angle = 90)) +
+  labs(fill = "Duplicat") 
+
+# Plot the ratio between replicates
+ggplot(data=samples_ab, aes(x=sampleID, y=log(ratio))) +
+  geom_bar(stat = "identity") +
+  xlab("Sample") +
+  ylab("log(ratio) ") +
+  theme(axis.text=element_text(size=10,angle = 90)) +
+  labs(fill = "Duplicat") 
+```
+
+## I-1.b.  Filter out samples that do not have more than 1000 reads
+```{r, echo=TRUE, warning=FALSE}
+## Filter 
+# Delete samples that have less than 1 000 reads
+samples_ab<-filter(samples_ab, total_read>1000)
+```
+
+=> No sample deleted
+
+# I-2.  Calculate and plot duplicat correlations 
+
+```{r , echo=FALSE, warning=FALSE}
+
+normaliseSampleMatrix <- function(data, meta){
+    norm.data <- apply(data,2, function(x) (x/sum(x))*100000) # here we normalise for each sample
+
+    # reformat  to have replicate a versus b
+    d2 <- melt(norm.data, id.vars=row.names(norm.data))  #change to long format 
+    norm_sample_readSum <- cbind(d2, ldply(strsplit(as.character(d2$Var2), "_"), identity) ) # split the identifier column
+    
+    names(norm_sample_readSum) <- c("tag","ID","value",colnames(meta)) #give name to categories
+    norm_sample_readSum<- norm_sample_readSum[which(norm_sample_readSum$value>0),] #delete zeros
+    
+    #data of rep a
+    norm_samples_a <- norm_sample_readSum[which(norm_sample_readSum$duplicats == 'a'),]
+    # delete duplicats and ID variables
+    norm_samples_a <- select(norm_samples_a, -c("duplicats", "ID"))
+    #delete the name of the row
+    row.names(norm_samples_a) <- NULL 
+    #rename the col var in vara
+    dimnames(norm_samples_a) [[2]][2]<- "vara"
+    
+    #idem with b
+    norm_samples_b <- norm_sample_readSum[which(norm_sample_readSum$duplicats == 'b'),]
+    row.names(norm_samples_b) <- NULL
+    norm_samples_b <- select(norm_samples_b, -c("duplicats", "ID"))
+    dimnames(norm_samples_b) [[2]][2]<- "varb"
+    
+    #create one table with a and b on the same row
+    norm_samples_ab <- merge(norm_samples_a,norm_samples_b,all=T)
+    norm_samples_ab[is.na(norm_samples_ab)]<-0 #delete na
+    
+    norm_samples_ab$total_read<-apply(select(norm_samples_ab,c("vara", "varb")), 1, sum)
+    
+    norm_samples_ab$sampleID <- apply(select(norm_samples_ab, colnames(select(meta, -c("duplicats"))) ), 1, function(x) { paste(x, collapse= "_") } )
+
+    return(norm_samples_ab)
+}
+
+# Calculate correlations for each sample
+calculateSampleCorrelations <- function(norm_samples_ab, meta){
+    cor_samples_ab <- ddply(norm_samples_ab, colnames(select(meta,-c("duplicats"))), summarize, cor=cor(vara,varb,use="na")) 
+    cor_samples_ab[is.na(cor_samples_ab)]<-0 #assign zeros to NA value
+    
+    #make an id for each sample so we can do plots
+    cor_samples_ab$sampleID <- apply(select(cor_samples_ab, colnames(select(meta, -c("duplicats"))) ), 1, function(x) { paste(x, collapse= "_") } )
+  
+    Cor_samples_ab <- merge(norm_samples_ab,cor_samples_ab,by= c("sampleID", colnames(select(meta, -c("duplicats")))))  
+    
+    return(Cor_samples_ab)
+}
+
+```
+
+
+# I-2.a.  Plot normalized data before duplicat correlations filtering 
+
+```{r, echo=FALSE, warning=FALSE}
+#  Normalise for each sample
+norm_samples_ab <- normaliseSampleMatrix(matx, metadata)
+cor_samples_ab <- calculateSampleCorrelations(norm_samples_ab, metadata)
+```
+
+Pearson correlation in title.
+1 dot <=> 1 barcode
+
+```{r, echo=TRUE, warning=FALSE}
+#plot replicates against each other before filtering
+# ADAPT facetwrap variables !!! 
+qplot(asinh(vara), asinh(varb), data=cor_samples_ab) + facet_wrap(~paste(sampleID, round(cor,2), sep = "_")) + ggtitle("selfself arcsin")
+
+
+#To better see correation score if name is too long
+ggplot(data=cor_samples_ab, aes(x=factor(sampleID), y=cor)) + 
+  geom_bar(stat = "identity", position = "identity") +
+  xlab("Samples") +
+  ylab("correlation scores") +
+  theme(axis.text=element_text(size=10,angle = 90)) 
+```
+
+
+# I-2.c.  Plot normalized data after duplicat correlations filtering
+
+## 1st step: Delete samples with a bad correlation score
+
+```{r, echo=TRUE, warning=FALSE}
+# 1st step: delete samples with a bad correlation score 
+cor_samples_ab<- cor_samples_ab[which(cor_samples_ab$cor>0.85),]
+``` 
+
+## 2nd step: Delete barcodes that are not shared between duplicats
+
+```{r, echo=TRUE, warning=FALSE}
+# 2nd step: Delete barcodes that are not shared between duplicats (total barcode abundances per duplicat)
+
+deleteNotDuplicats <- function(matx_ab){
+  #here we delete the barcodes not shared between duplicates
+  ab_present <- matx_ab[which(matx_ab$vara>0 & matx_ab$varb>0),]
+  return(ab_present)
+}
+
+#  Filter barcodes on ab present
+norm_filt_ab <- deleteNotDuplicats(cor_samples_ab)
+nb_bc<-length(unique(norm_filt_ab$tag))
+# number of barcodes befor filtering on repeat use
+nb_bc
+
+
+
+#plot replicates
+qplot(asinh(vara), asinh(varb), data=norm_filt_ab) + facet_wrap(~paste(sampleID, sep = "_")) + ggtitle("selfself arcsin")
+
+```
+
+Export table before repeat use control:
+
+```{r, echo=TRUE, warning=FALSE}
+# Reformat table to have sample with duplicats names in it
+norm_filt_ab_wide<-melt(norm_filt_ab, measure.vars = c("vara", "varb"))
+norm_filt_ab_wide$variable<-str_remove(norm_filt_ab_wide$variable, "var")
+norm_filt_ab_wide$sampleID<-apply(select(norm_filt_ab_wide, c(variable, sampleID)),  1, function(x) {paste0(x[1], "_", x[2])} ) 
+# long to wide format
+finalQC_cor_ab<-dcast(norm_filt_ab_wide, tag~sampleID, value.var = "value")
+finalQC_cor_ab[is.na(finalQC_cor_ab)]<-0
+
+write.csv(finalQC_cor_ab, "/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/JCW19_LENTI_BARCODING/Data_analysis/results/outputs _QC_and_preprocessing/outputs_for_QC/STB13_L400_DUPLICATS_matx_norm_filt_cor_ab.csv", sep = ",", quote = FALSE, row.names = F)
+```
+
+
+# I-3.  Repeat use control
+
+Commonly, if not more than 5% of repeat use (ru) are present, then no treatment is done on this part.
+
+Nevertheless, if more than 5% of repeat use are present, first, delete true ones (quantile method).
+
+And, if after removing true ru barcodes, still more than 5% are present, set false ru to 0 to minimized noise
+
+## I-3.a - Repeat use calculation
+```{r, echo=TRUE, warning=FALSE}
+# Get all repeat use
+repeat_use<-dcast(norm_filt_ab, tag~mouse, value.var = "total_read", fun.aggregate = sum)
+# calculate number of repeat use
+repeat_use$ru<-apply(repeat_use[,-1], 1, function(x) length(which(x>0)))
+# keep only repeated one across mice
+repeat_use<-repeat_use[which(repeat_use$ru>1),]
+nb_ru<-nrow(repeat_use)
+repeat_use<-repeat_use[,c(1:5)]
+
+######## Almut method
+# to not take 0 in the calculation of quantile, set them to NA
+repeat_use[repeat_use==0]<-NA
+rownames(repeat_use)<-repeat_use[,1]
+quantile<-quantile(repeat_use[,-1],probs=95/100, na.rm=TRUE)
+# les vauleurs inféreures au quantile 95 sont misent à 0 et les autres sont gardées.
+repeat_use[is.na(repeat_use)]<-0
+true_repeat_use <- apply(repeat_use[,-1], 2, function(x) ifelse(x < quantile, 0, x))
+true_repeat_use<-as.data.frame(true_repeat_use)
+nb_true_ru<-nrow(true_repeat_use[which(rowSums(true_repeat_use)==0),])
+# 14 vrais repeat use --> sont "supprimés" car mis à 0 
+
+nb_ru/nb_bc
+## ==>  32% of repeat use
+
+nb_true_ru/nb_bc
+## ==> 27% of true repeat use 
+
+```
+
+## I-3.b - Filter out true repeat use
+
+```{r, echo=TRUE, warning=FALSE}
+## 2nd filtering = Delete True repeat use
+
+# In the matrix "true_repeat_use" there are barcodes to delete (sum = 0) & barcodes keeped but set to 0 in some mice because they are false repeat use (with low abundance)
+
+# Get true repeat use
+barcodes_toDelete<-data.frame(toDelete=rownames(true_repeat_use[which(rowSums(true_repeat_use)==0),]))
+norm_filt_ab_trueRu<-filter(norm_filt_ab, !tag %in% barcodes_toDelete$toDelete)
+
+# Reformat long duplicat matrix to wide format to export it as final QC matrix (<=> input of the app)
+norm_filt_ab_trueRu_wide<-melt(norm_filt_ab_trueRu, measure.vars = c("vara", "varb"))
+norm_filt_ab_trueRu_wide$variable<-str_remove(norm_filt_ab_trueRu_wide$variable, "var")
+norm_filt_ab_trueRu_wide$sampleID<-apply(select(norm_filt_ab_trueRu_wide, c(variable, sampleID)),  1, function(x) {paste0(x[1], "_", x[2])} ) 
+# long to wide format
+finalQC<-dcast(norm_filt_ab_trueRu_wide, tag~sampleID, value.var = "value")
+finalQC[is.na(finalQC)]<-0
+# number of barcodes after true ru filtering 
+nrow(finalQC)
+## export QC matrix
+write.csv(finalQC, "/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/JCW19_LENTI_BARCODING/Data_analysis/results/outputs _QC_and_preprocessing/outputs_for_QC/STB13_L400_DUPLICATS_matx_norm_filt_cor_ab_trueRU.csv", sep = ",", quote = FALSE, row.names = F)
+```
+
+## I-3.c - Set false repeat use to 0 
+
+```{r, echo=TRUE, warning=FALSE}
+## 3rd filtering = false ru barcodes set to 0
+
+true_repeat_use$tag<-rownames(true_repeat_use)
+toBalance<-melt(true_repeat_use[which(rowSums(true_repeat_use[,-5])>0),], id.vars = "tag")
+toBalance<-toBalance[toBalance$value>0,]
+
+lg_filtred<-melt(finalQC, id.vars = "tag")
+for( i in 1:nrow(toBalance)){ 
+    # For false true barcodes, set them to 0 and keep their values in corresponding mice
+    lg_filtred[which(lg_filtred$tag==toBalance[i,]$tag & !grepl(lg_filtred$variable, pattern = paste0("_", toBalance[i,]$variable, "_") )),3]<-0
+}
+
+# create matrix filtred on false repeat use
+final_trueANDfalse_RU_filtred<-dcast(lg_filtred, tag~variable)
+final_trueANDfalse_RU_filtred<-final_trueANDfalse_RU_filtred[rowSums(final_trueANDfalse_RU_filtred[,-1])>0,]
+
+# EXPORT 
+write.csv(final_trueANDfalse_RU_filtred, "/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/JCW19_LENTI_BARCODING/Data_analysis/results/outputs _QC_and_preprocessing/outputs_for_QC/STB13_L400_DUPLICATS_matx_norm_filt_cor_ab_trueFalseRU.csv", sep = ",", quote = FALSE, row.names = F)
+```
+
+
+# II - Merge duplicats to create analysis filtred matrix
+
+```{r, echo=FALSE, warning=FALSE}
+# Done in the app
+wideToLong<-function(wideMatrix,metadata){
+  longMat<-reshape2::melt(wideMatrix, variable.name ="samples", id.vars = names(wideMatrix[1]))
+  longMat<-cbind(longMat,ldply(strsplit(as.character(longMat$samples),"_"),identity))
+  colnames(longMat)<-c("Barcodes", "Sample_names","counts",colnames(metadata))
+  return(longMat)
+}
+
+plotHeatmap <- function(SubMatrix, distance, clusteringMeth, dendro){
+  # distance function
+  mydistM = function(z) dist(z,distance)
+  # METHODS <- c("euclidean", "maximum", "manhattan", "canberra","binary", "minkowski")
+  # distance method for clustering
+  myhclu = function(d) hclust(d,method=clusteringMeth)
+  # METHODS <- c("ward.D", "single", "complete", "average", "mcquitty", "median", "centroid", "ward.D2")
+  # cluster method
+
+  if(dendro=="no"){
+    myhm = function(y) gplots::heatmap.2(y, distfun=mydistM, hclustfun=myhclu,
+                                         margins = c(12, 12),
+                                         scale="none",
+                                         col=colorRampPalette(c("black","green","red"))(1500),
+                                         labCol = NULL, cexCol=0.6, srtCol=45,
+                                         key=TRUE, key.title = NA, density.info="none",
+                                         trace="none", dendrogram ="none")
+  }else{
+    myhm = function(y) gplots::heatmap.2(y, distfun=mydistM, hclustfun=myhclu,
+                                         margins = c(12,12),
+                                         scale="none",
+                                         col=colorRampPalette(c("black","green","red"))(1500),
+                                         labCol = NULL, cexCol=0.6, srtCol=45,
+                                         key=TRUE, key.title = NA, density.info="none",
+                                         trace="none", dendrogram ="both")
+  }
+
+  # transformation and cleaning
+  x <- asinh(SubMatrix)
+  m <-as.matrix(x)
+
+  # heatmap object
+  heatMap <- myhm(m)
+  return(heatMap)
+}
+
+```
+
+
+## II - 1. No repeat use filtering 
+```{r, echo=TRUE, warning=FALSE}
+
+######### export ANALYSIS Matrix
+
+####### Matrix without repeat use deleteions
+# from the filtred duplicats matrix, delete duplicats information and take the sum of both
+analysis_matx_lg<-norm_filt_ab_wide
+analysis_matx_lg$sampleID<-str_remove(analysis_matx_lg$sampleID, "a_")
+analysis_matx_lg$sampleID<-str_remove(analysis_matx_lg$sampleID, "b_")
+
+# long to wide
+analysis_matx_wide<-dcast(analysis_matx_lg, tag~sampleID, fun.aggregate = sum, value.var = "value")
+
+write.csv(analysis_matx_wide, "/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/JCW19_LENTI_BARCODING/Data_analysis/results/outputs _QC_and_preprocessing/outputs_for_Analysis/STB13_L400_ANALYSIS_matx_norm_filt_cor_ab.csv", sep = ",", quote = FALSE, row.names = F)
+```
+
+```{r, echo=TRUE, warning=FALSE}
+## Plot heatmap
+
+distance<-"euclidean"
+clusteringMeth<-"complete"
+dendro<-"no"
+
+p<-plotHeatmap(analysis_matx_wide[,-1], distance,clusteringMeth, dendro)
+
+# reformat 
+metadata<-read.csv("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/JCW19_LENTI_BARCODING/Data_analysis/results/outputs _QC_and_preprocessing/outputs_for_Analysis/analysis_metadata.csv", header = TRUE)
+matx<-wideToLong(analysis_matx_wide, metadata )
+matx<-filter(matx, counts>0)
+matx_mice<-dcast(matx, Barcodes~mouse, fun.aggregate = sum, value.var = "counts")
+
+# plot
+p<-plotHeatmap(matx_mice[,-1], distance,clusteringMeth, dendro)
+```
+
+
+
+## II - 2. True repeat use filtering 
+
+```{r, echo=TRUE, warning=FALSE}
+
+####### Matrix with true repeat use deletion
+
+# from the filtred duplicats matrix, delete duplicats information and take the sum of both
+analysis_matx_lg<-norm_filt_ab_trueRu_wide
+analysis_matx_lg$sampleID<-str_remove(analysis_matx_lg$sampleID, "a_")
+analysis_matx_lg$sampleID<-str_remove(analysis_matx_lg$sampleID, "b_")
+
+# long to wide
+analysis_matx_wide<-dcast(analysis_matx_lg, tag~sampleID, fun.aggregate = sum, value.var = "value")
+
+write.csv(analysis_matx_wide, "/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/JCW19_LENTI_BARCODING/Data_analysis/results/outputs _QC_and_preprocessing/outputs_for_Analysis/STB13_L400_ANALYSIS_matx_norm_filt_cor_ab_trueRU.csv", sep = ",", quote = FALSE, row.names = F)
+```
+
+```{r, echo=TRUE, warning=FALSE}
+## Plot heatmap
+
+distance<-"euclidean"
+clusteringMeth<-"complete"
+dendro<-"no"
+
+p<-plotHeatmap(analysis_matx_wide[,-1], distance,clusteringMeth, dendro)
+
+# reformat 
+metadata<-read.csv("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/JCW19_LENTI_BARCODING/Data_analysis/results/outputs _QC_and_preprocessing/outputs_for_Analysis/analysis_metadata.csv", header = TRUE)
+matx<-wideToLong(analysis_matx_wide, metadata )
+matx<-filter(matx, counts>0)
+matx_mice<-dcast(matx, Barcodes~mouse, fun.aggregate = sum, value.var = "counts")
+
+# plot
+p<-plotHeatmap(matx_mice[,-1], distance,clusteringMeth, dendro)
+```
+
+## II - 3. True repeat use filtering and false set to 0
+
+```{r, echo=TRUE, warning=FALSE}
+
+####### Matrix with true repeat use deletion and false repeat use barcode abundances set to 0 
+
+# from the filtred duplicats matrix, delete duplicats information and take the sum of both
+analysis_matx_lg<-lg_filtred
+analysis_matx_lg$variable<-str_remove(analysis_matx_lg$variable, "a_")
+analysis_matx_lg$variable<-str_remove(analysis_matx_lg$variable, "b_")
+
+# long to wide
+analysis_matx_wide<-dcast(analysis_matx_lg, tag~variable, fun.aggregate = sum, value.var = "value")
+
+write.csv(analysis_matx_wide, "/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/JCW19_LENTI_BARCODING/Data_analysis/results/outputs _QC_and_preprocessing/outputs_for_Analysis/STB13_L400_ANALYSIS_matx_norm_filt_cor_ab_trueFalseRU.csv", sep = ",", quote = FALSE, row.names = F)
+
+
+
+```
+
+```{r, echo=TRUE, warning=FALSE}
+## Plot heatmap
+
+distance<-"euclidean"
+clusteringMeth<-"complete"
+dendro<-"no"
+
+p<-plotHeatmap(analysis_matx_wide[,-1], distance,clusteringMeth, dendro)
+
+# reformat 
+metadata<-read.csv("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/JCW19_LENTI_BARCODING/Data_analysis/results/outputs _QC_and_preprocessing/outputs_for_Analysis/analysis_metadata.csv", header = TRUE)
+matx<-wideToLong(analysis_matx_wide, metadata )
+matx<-filter(matx, counts>0)
+matx_mice<-dcast(matx, Barcodes~mouse, fun.aggregate = sum, value.var = "counts")
+
+# plot
+p<-plotHeatmap(matx_mice[,-1], distance,clusteringMeth, dendro)
+```
+
+

@@ -1,0 +1,73 @@
+#!/usr/bin/env perl 
+
+use strict;
+use warnings;
+
+use Pod::Usage;
+use Getopt::Long;
+use Storable;
+use IO::Uncompress::Gunzip;
+
+my $length = 0;
+my $help;
+
+GetOptions("length|l:i"=>$length, "help|h"=>\$help) or pod2usage(2);
+pod2usage(1) if $help;
+
+my $hashfile = shift;
+my $fqfile = shift;
+
+my %seqs  = ();
+
+#is it a gzip file?
+my $fh;
+if(not defined $fqfile) {
+	$fh = \*STDIN;
+	$fqfile = "STDIN";
+	print STDERR "Reading fastq data from STDIN\n";
+} elsif ($fqfile =~ /.gz$/) {
+	$fh = new IO::Uncompress::Gunzip $fqfile;
+} else {
+	open($fh,"<", $fqfile) or die "Couldn't open $fqfile\n";
+}
+
+while(my $name = <$fh>) {
+	die "Not a valid fq, name should start with '\@'\n" unless substr($name,0,1) eq "@";
+	my $seq = <$fh>;
+	my $name2 = <$fh>;
+	my $qual = <$fh>;
+
+	chomp($seq);
+	$seqs{$length ? substr($seq, $length) : $seq}++;
+
+}
+
+print "Storing ", scalar(keys(%seqs)), " unique reads...";
+store(\%seqs, $hashfile);
+print "Done\n";
+
+__END__
+=head1 NAME
+
+hashreads - parse fastq data and create a hashed binary file
+
+=head1 SYNOPSIS
+
+hashreads [--length <bp>] <outputfile> [fastqfile[.gz]]
+
+Reads uncompressed FASTQ from stdin if no fastqfile is provided.
+
+Options:
+
+	--help      brief help message
+
+	--length n  clip the fast reads after n bases
+
+=head1 DESCRIPTION
+
+B<hashreads> will read a (compressed) fastq file from the command line
+or an uncompressed stream from STDIN and create a binary and counted format.
+This file can then be used to make a count table or be explored using the
+B<analyzehash> program
+
+=cut

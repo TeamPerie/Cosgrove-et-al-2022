@@ -1,0 +1,295 @@
+---
+title: "Figure 1D: Pseudotime analysis"
+author: 
+- name: Jason Cosgrove (jason.cosgrove@curie.fr)
+  affiliation:  Institut Curie, UMR168
+editor_options:
+  chunk_output_type: inline
+output:
+  html_document:
+    df_print: paged
+    number_sections: yes
+    toc: yes
+  pdf_document:
+    toc: yes
+---
+---
+
+<style type="text/css">
+
+body{ /* Normal  */
+      font-size: 18px;
+  }
+td {  /* Table  */
+  font-size: 8px;
+}
+h1.title {
+  font-size: 38px;
+  color: DarkRed;
+}
+h1 { /* Header 1 */
+  font-size: 28px;
+  color: DarkBlue;
+}
+h2 { /* Header 2 */
+    font-size: 22px;
+  color: DarkBlue;
+}
+h3 { /* Header 3 */
+  font-size: 18px;
+  font-family: "Times New Roman", Times, serif;
+  color: DarkBlue;
+}
+code.r{ /* Code block */
+    font-size: 10px;
+}
+pre { /* Code block - determines code spacing between lines */
+    font-size: 14px;
+}
+</style>
+
+
+
+# Introduction 
+Model the differentiation of hematopoietic stem and progneitors using the PAGA algorithm, to understand how enzyme and transporter expression dynamics change over time
+
+```{r setup, include=FALSE}
+#Set up the workspace
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = '/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/JCB4_metabolism_bioinformatics_pipeline')
+
+#clear the workspace and set the working directory
+rm(list = ls())
+
+#load in the packages that we need to run this analysis
+library(Seurat)
+library(xgboost)
+library(pROC)
+library(dplyr)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(Rmagic)
+#source("module8_helpermethods.R")
+
+
+
+#set the seed so we can reproduce the results
+set.seed(12345)
+
+```
+
+
+
+# Load the scRNAseq data
+
+Load in the Dahlin dataset and perform cluster annotation using known lineage associated markers. This is a dataset of 44,802 cKit+ and cKit+ Sca1+ HSPCs sequencing using the 10X genomics platform
+
+```{r prepData}
+#load in teh haemopedia dataset in the form of a seurat object
+load("datasets/Dahlin/Dahlin_SeuratObject.Rda")
+
+E.markers <- c("Gata1","Klf1","Hba-a1")
+Neu.markers <- c("Elane", "Ctsg", "Mpo")
+Mono.markers <- c("Irf8","Csf1r")
+Meg.markers <- c("Itga2b", "Vwf")
+Baso.markers <- c("Mcpt8","Prss34")
+B.markers <- c("Cd19","Vpreb2","Cd79a")
+Mast.markers <- c("Cma1","Gzmb")
+mast.baso.markers <- c("Ms4a2", "Fcer1a")
+
+
+
+#use a violin plot visualisation to look for which clusters are lineage primed
+
+VlnPlot(dahlin, features = E.markers,pt.size = 0.1)#cluster 3 and 9 also
+VlnPlot(dahlin, features = c(Neu.markers,Mono.markers),pt.size = 0.1)#cluster 3 and 9 also
+
+
+Idents(dahlin) <- dahlin@meta.data$clusters
+downsampled.obj <- dahlin[, sample(colnames(dahlin), size = 8000, replace=F)]
+
+```
+
+
+
+# Data imputation
+
+scRNAseq data is very sparse and this limits our ability to visualise transporter and enzyme dynamics along lineage differentiation trajectories. To deal with this  issue we use MAGIC (Markov affinity-based graph imputation of cells) - a method for addressing technical noise in single-cell data, including under-sampling of mRNA molecules, often termed "dropout" which can severely obscure important gene-gene relationships. MAGIC shares information across similar cells, via data diffusion, to denoise the cell count matrix and fill in missing transcripts. Read more: van Dijk et al. (2018) <doi:10.1016/j.cell.2018.05.061>.
+```{r imputation}
+
+downsampled.obj<- magic(downsampled.obj,npca = 10)
+DefaultAssay(downsampled.obj) <- "MAGIC_RNA"
+downsampled.obj <- ScaleData(downsampled.obj, verbose = FALSE)
+
+save(downsampled.obj, file = '/Users/jasoncosgrove/Desktop/downsampled_dahlin.Rda')
+
+rm(dahlin)
+
+```
+
+
+
+# Define the lineage differentiation trajectories
+
+Use our PAGA based annotation - calculated already in python using the scanpy package - to define lineage differentiation trajectories.
+
+```{r pseudoTimePlot}
+
+
+
+dahlin <- downsampled.obj
+
+#lets merge the MPP clusters, we dont get much info from this increased resolution
+dahlin@meta.data$clusters[dahlin@meta.data$clusters == 0] <- 2 
+Idents(dahlin) <- dahlin@meta.data$clusters
+
+#set the trajectories that you are interested in based on our clustering-based cell-state transition model from PAGA
+erythrocytes <- c(13,2, 8,10, 3,9, 11)
+monocytes <- c(13,2,8, 4,6)
+basophils<- c(13,2,8, 4,7)
+neutrophils<- c(13,2,8, 4,5)
+myeloid <- c(13,2,8, 4,6,5)
+lymphoid<- c(13,2, 1,14)
+
+
+
+```
+
+
+
+# Model the myeloid differentiation trajectory
+```{r MyeloidDiff}
+
+
+
+#subset the data to include only the myeloid relevant clusters
+dahlin.subset <- subset(dahlin,idents = myeloid)
+trajectory <- myeloid
+
+#organise the cells by cluster and then by psuedotime
+df <- data.frame(dahlin.subset@meta.data[,colnames(dahlin.subset@meta.data) == "clusters" | colnames(dahlin.subset@meta.data) == "dpt.pseudotime"])
+df$clusters <- factor(df$clusters, levels = trajectory)
+df <- df[order(df$clusters,df$dpt.pseudotime),]
+df$cell <- rownames(df)
+
+dahlin.subset@active.ident <- factor(dahlin.subset@active.ident,levels=trajectory)
+custom_order <- df$cell
+genes.to.plot <- c("Ptgs1","Tbxas1","Ldhb","Fbp1","Hk3","Pgam1",
+                  "Gpx1","Idh1","Gsr","G6pdx","Taldo1")
+
+
+
+load("genesets/geneset_Robjects/metabolic_signatures_metafate.Rda")
+
+#choose the colors to keep the same color scheme as in figure 1C. 
+myeloid.colors <- c("mediumpurple1","springgreen4","turquoise1","purple","plum1","saddlebrown")
+
+
+
+
+early.onset <- c("Mcur1","Mgst2","Pex3","Dhrs3","Acads")
+int.onset <- c("Slc43a2","Idh2","Ndufa4","Pgam1")
+late.onset <- c("Pgls","Slc4a8","Atp8b4","Sec61b","P4hb","Cox7b","Gng12",'Taldo1',"Srm","Uqcc2","Nans","Trap1","Mgst2")
+
+#tiff("/Users/jasoncosgrove/Desktop/heatmapM.tiff", width = 5, 
+#     height = 4, units = 'in', res = 300)
+p <- DoHeatmap(dahlin.subset, features = c(genes.to.plot
+                                           ),cells = df$cell,
+               disp.min = -1.5, disp.max = 1.5,draw.lines = F,group.colors = myeloid.colors) +NoLegend() + scale_fill_gradientn(colors = c("white","grey90","grey30","black")) + theme(text = element_text(size = 20)) 
+
+p
+#dev.off()
+
+
+
+DoHeatmap(dahlin.subset, features = c(early.onset,int.onset,late.onset),cells = df$cell,
+               disp.min = -1.5, disp.max = 1.5,draw.lines = F,group.colors = myeloid.colors) +NoLegend() + scale_fill_gradientn(colors = c("white","grey90","grey30","black")) + theme(text = element_text(size = 20)) 
+
+
+dahlin.subset <- AddModuleScore(dahlin.subset, features = list(metabolic.signatures$metafate_m), name = "M")
+
+
+
+load('/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/JCB4_metabolism_bioinformatics_pipeline/genesets/geneset_Robjects/KEGG_metabolic.Rda')
+
+for(i in 1:length(names(KEGG.sets.metabolic))){
+  
+  dahlin.subset <- AddModuleScore(dahlin.subset, features = list(KEGG.sets.metabolic[i][[1]]), name = "temp")
+  
+  dahlin.subset@assays$MAGIC_RNA@scale.data[i,] <- scale(dahlin.subset@meta.data$temp1, center = TRUE, scale = TRUE)
+  
+  rownames(dahlin.subset@assays$MAGIC_RNA@scale.data)[i] <- names(KEGG.sets.metabolic)[i]
+  
+}
+
+
+
+dahlin.subset <- AddModuleScore(dahlin.subset, features = list(metabolic.signatures$metafate_m), name = "temp")
+  dahlin.subset@assays$MAGIC_RNA@scale.data[50,] <- scale(dahlin.subset@meta.data$temp1, center = TRUE, scale = TRUE)
+
+genes <- rownames(dahlin.subset@assays$MAGIC_RNA@scale.data)[21:45]
+
+rownames(dahlin.subset@assays$MAGIC_RNA@scale.data)[50] <-  "META_FATE_MYELOID"
+
+DoHeatmap(dahlin.subset, features = c(genes),cells = df$cell,
+               disp.min = -1.5, disp.max = 1.5,draw.lines = F,group.colors = myeloid.colors) +NoLegend() + scale_fill_gradientn(colors = c("white","grey90","grey30","black")) + theme(text = element_text(size = 5)) 
+
+early.onset <- c( "KEGG_FATTY_ACID_METABOLISM"   ,
+"KEGG_ASCORBATE_AND_ALDARATE_METABOLISM" , 
+"KEGG_RETINOL_METABOLISM"
+)
+
+late.onset <- c(
+"KEGG_GLYCOLYSIS_GLUCONEOGENESIS", 
+"KEGG_PENTOSE_PHOSPHATE_PATHWAY",
+ "KEGG_GLUTATHIONE_METABOLISM"    ,                 
+"KEGG_OXIDATIVE_PHOSPHORYLATION" ,
+"KEGG_CITRATE_CYCLE_TCA_CYCLE"  ,"Sell","META_FATE_MYELOID")
+
+tiff("/Users/jasoncosgrove/Desktop/heatmapM.tiff", width = 12, 
+    height = 6, units = 'in', res = 300)
+DoHeatmap(dahlin.subset, features = c(early.onset,late.onset),cells = df$cell,
+               disp.min = -1.5, disp.max = 1.5,draw.lines = F,group.colors = myeloid.colors) +NoLegend() + scale_fill_gradientn(colors = c("white","grey90","grey30","black")) + theme(text = element_text(size = 10,face = "bold")) 
+dev.off()
+
+```
+
+# Model the erythroid differentiation trajectory
+```{r ERY_DIFF}
+
+dahlin.subset <- subset(dahlin,idents = erythrocytes)
+trajectory <- erythrocytes
+
+df <- data.frame(dahlin.subset@meta.data[,colnames(dahlin.subset@meta.data) == "clusters" | colnames(dahlin.subset@meta.data) == "dpt.pseudotime"])
+df$clusters <- factor(df$clusters, levels = trajectory)
+df <- df[order(df$clusters,df$dpt.pseudotime),]
+df$cell <- rownames(df)
+
+
+dahlin.subset@active.ident <- factor(dahlin.subset@active.ident,levels=trajectory)
+custom_order <- df$cell
+
+
+ery.colors <- c("mediumpurple1","springgreen4","turquoise1","yellow2","red2","lightskyblue1","palegreen3")
+
+#tiff("/Users/jasoncosgrove/Desktop/heatmapE.tiff", width = 5, 
+#     height = 4, units = 'in', res = 300)
+p <- DoHeatmap(dahlin.subset, features = c("Pkm","Ldhb","Pgam1","Mgat1","Gclm","Atpif1","Gstm5","Aqp1","Abcb10","Steap3","Uqcr11"
+                                           ),cells = df$cell,
+               disp.min = -1.5, disp.max = 1.5,draw.lines = F,group.colors = ery.colors) +NoLegend() + scale_fill_gradientn(colors = c("white","grey90","grey30","black")) + theme(text = element_text(size = 20)) 
+
+p
+#dev.off()
+
+
+
+
+```
+
+
+
+
+
+
+

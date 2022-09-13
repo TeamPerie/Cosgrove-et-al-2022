@@ -1,0 +1,519 @@
+---
+title: "Module 1: Analysis of the Haemopedia Database"
+author: 
+- name: Jason Cosgrove (jason.cosgrove@curie.fr)
+  affiliation:  Institut Curie, UMR168
+editor_options:
+  chunk_output_type: inline
+output:
+  html_document:
+    df_print: paged
+    number_sections: yes
+    toc: yes
+  pdf_document:
+    toc: yes
+---
+---
+
+<style type="text/css">
+
+body{ /* Normal  */
+      font-size: 18px;
+  }
+td {  /* Table  */
+  font-size: 8px;
+}
+h1.title {
+  font-size: 38px;
+  color: DarkRed;
+}
+h1 { /* Header 1 */
+  font-size: 28px;
+  color: DarkBlue;
+}
+h2 { /* Header 2 */
+    font-size: 22px;
+  color: DarkBlue;
+}
+h3 { /* Header 3 */
+  font-size: 18px;
+  font-family: "Times New Roman", Times, serif;
+  color: DarkBlue;
+}
+code.r{ /* Code block */
+    font-size: 10px;
+}
+pre { /* Code block - determines code spacing between lines */
+    font-size: 14px;
+}
+</style>
+
+
+
+# Introduction 
+In this analysis we analyse the haemopedia bulk RNAseq database (1) to identify metabolic signature of lineage bias. More specifically, we perform data QC and normalisation followed by differential expression and pathway enrichment analysis.
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list=ls())
+
+setwd("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/JCB4_metabolism_bioinformatics_pipeline")
+#load in the packages that we need to run this analysis
+library(Seurat)
+library(dplyr)
+library(edgeR)
+library(limma)
+library(Glimma)
+require(DESeq2)
+library(cowplot)
+library(ggplot2)
+
+source("helpermethods.R")
+load("genesets/geneset_Robjects/metabolic_signatures_metafate.Rda")
+
+#set the seed so we can reproduce the results
+set.seed(12345)
+
+dir.create("Results",showWarnings = F)
+dir.create("Results/Module1",showWarnings = F)
+
+```
+
+
+# Data QC and normalisation using the LIMMA package. 
+
+Filter the dataset and normalise using limmas voom function. The voom method transforms count data to log2-counts per million (logCPM), then estimates the mean-variance relationship in the data to compute appropriate observation-level weights.
+
+
+```{r load_and_normalise_data, echo=FALSE, eval= TRUE}
+
+#load in the haemopedia dataset which we have stored as a DGEobject, this has been downloaded. 
+load("datasets/Haemopedia/DGE_object_haemopedia.Rda")
+
+
+
+# filter out activated lymphocytes, megs and pDCs as these are not relevant to our research  question
+cells.to.remove <- c("GCB.1","GCB.2","SplPlsB.1" ,
+                      "SplPlsC.1","SplPlsC.2",
+                      "SplPlsC.3","BMPlsC.1","MemCD4T.1",
+                      "EffCD4T.1","pDC.1",
+                      "pDC.2",
+                      "EffCD4T.2","MemCD4T.2",  
+                      "MemCD8T.2","MemCD8T.1",
+                      "MemCD4T.1", "pDC.1", "pDC.2",
+                      "MegTPO.1",  "MegTPO.2")
+
+
+#filter out lowly expressed genes, and also cells that we are not interested in. 
+haemopedia.filtered <- filterData(haemopedia,cells.to.remove)
+
+#add the lineage annotations for our analysis
+lin <- performLineageAnnotation(haemopedia.filtered)
+
+
+condition <-factor(lin)
+design <- model.matrix( ~ 0 + condition)
+colnames(design) <- levels( condition )
+
+#calculate normalisation factors for each cell type
+y <- calcNormFactors(haemopedia.filtered) 
+
+#run the zoon transformation
+v <- voom(haemopedia.filtered,design,plot = TRUE, span = 0.1,normalize.method = "quantile") 
+#plot the library sizes for each sample as a sanity check
+boxplot(v$E)
+
+
+
+
+#write the data to file as we will need this for miic
+load("genesets/geneset_Robjects/metabolic_signatures_metafate.Rda")
+
+
+seq <- unique(c(metabolic.signatures$sequential_erythroid,
+         metabolic.signatures$sequential_myeloid,
+         metabolic.signatures$sequential_lymphoid,
+         metabolic.signatures$metafate_m))
+
+haemopedia.filtered <- t(haemopedia.filtered$counts)
+haemopedia.filtered <- data.frame(haemopedia.filtered)
+haemopedia.filtered$lin <- paste(lin)
+mat <- haemopedia.filtered[rownames(data.withlineage),c("lin",seq)]
+
+
+write.csv(mat,"Results/module3/sequential_for_miic_metafate_RAWDATA.csv")
+
+```
+
+
+
+
+```{r PCA}
+
+
+#Create a DESEq project
+dds <- DESeqDataSetFromMatrix(countData=y$counts,
+                              DataFrame(condition=condition),
+                              design=~ 0 + condition)
+dds <- estimateSizeFactors(dds)
+
+### For exploratory analysis, let's normalize by VST
+rld <- vst(dds, blind=TRUE)
+d.rld <- assay(rld)
+
+#select metabolically associated genes within the top 1000 most variably expressed genes
+var_genes <- rowVars(d.rld)
+select_var <- order(var_genes, decreasing=TRUE)[1:1000]
+genes <- intersect(rownames(y)[select_var], c(metabolic.signatures$justMetabolicKegg,metabolic.signatures$justTransport))
+
+#now run a PCA on just those genes
+pca <- prcomp(t(d.rld[genes,]))
+df <- as.data.frame(pca$x)
+df$condition <- condition
+percentVar <- round(pca$sdev^2/sum(pca$sdev^2)*100)
+
+
+
+
+tiff("PCA.tiff", units = "in" , width = 10, height = 10 , res = 300)
+
+  print(p1.1 <- ggplot(df) + geom_point(aes(PC1, PC2, color=condition), size=3) +
+  labs(title="", x=paste0("PC1: ",percentVar[1],"% variance"),
+       y=paste0("PC2: ",percentVar[2],"% variance")) +
+        theme_classic(base_size = 16) + theme(legend.title=element_blank()) + scale_color_manual(values=c("firebrick2","#E69F00","grey", "#56B4E9","grey")))
+  
+dev.off()
+
+
+
+p1.2 <- ggplot(df) + geom_point(aes(PC3, PC4, color=condition), size=3) +
+  labs(title="", x=paste0("PC3: ",percentVar[3],"% variance"),
+       y=paste0("PC4: ",percentVar[4],"% variance")) +
+  theme_classic(base_size = 16) + theme(legend.title=element_blank())
+
+grid.arrange(p1.1 , p1.2, ncol=2)
+
+
+
+
+
+var_genes <- rowVars(d.rld)
+select_var <- order(var_genes, decreasing=TRUE)[1:2000]
+genes <- intersect(rownames(y)[select_var], c(metabolic.signatures$metafate_m))
+
+#now run a PCA on just those genes
+pca <- prcomp(t(d.rld[genes,]))
+df <- as.data.frame(pca$x)
+df$condition <- condition
+percentVar <- round(pca$sdev^2/sum(pca$sdev^2)*100)
+
+ggplot(df) + geom_point(aes(PC1, PC2, color=condition), size=3) +
+  labs(title="", x=paste0("PC1: ",percentVar[1],"% variance"),
+       y=paste0("PC2: ",percentVar[2],"% variance")) +
+        theme_classic(base_size = 16) + theme(legend.title=element_blank()) + scale_color_manual(values=c("firebrick2","#E69F00","grey", "#56B4E9","grey"))
+
+```
+
+
+
+# Data visualisation using the Seurat package
+Convert the data into a seurat object (3) and visualise using PCA and non-linear equivalents such as UMAP
+
+
+```{r convertToSeurat, echo=FALSE, eval= TRUE, message = FALSE, warning = FALSE}
+
+#TODO this needs to be a section linked to causality or even a separate module
+haem.seurat <- convertToSeurat(v$E)
+
+
+
+
+DoHeatmap(haem.seurat, features = metabolic.signatures$metafate_m,group.by = "lineage", disp.max = 2, disp.min = -2)
+
+
+DotPlot(haem.seurat, features = genes, dot.scale = 8, split.by = "lineage",cols = c("lightgrey", "blue","red","green","black")) + 
+    RotatedAxis()
+
+haem.seurat@meta.data$lineage[colnames(haem.seurat) %in% c("GMP.1","GMP.2")] <- "M_Prog"
+haem.seurat@meta.data$lineage[colnames(haem.seurat) %in% c("MEP.1","MEP.2")] <- "E_Prog"
+haem.seurat@meta.data$lineage[colnames(haem.seurat) %in% c("CLP.1","CLP.2")] <- "L_Prog"
+
+rpps <-  c("GMP.1","GMP.2" ,"MEP.1","MEP.2" ,"CLP.1","CLP.2")
+
+#genes3 <- c("Gpx1","Atpif1","Gstm5","Uqcr11","Abcb10","Slc14a1",
+   #         "Gsr","Pkm","Idh1","Hexa","Hk3","G6pdx","Neu1","Atp6ap2")
+
+
+genes3 <- c("Gsr","Pkm","Idh1","Hexa","Hk3","G6pdx","Neu1","Atp6ap2")
+
+mature <- colnames(haem.seurat)[haem.seurat@meta.data$lineage %in% c("Myeloid","Erythroid","Lymphoid","M_Prog","E_Prog","L_Prog")]
+
+#log.confidence.scores.from.miic <- data.frame(c(39.5,57.9,42.4,41.3,38,43.9,
+#                                                53.9, 49, 37.8, #42.7,38.3,45,38.3,38.8))
+
+
+log.confidence.scores.from.miic <- data.frame(c(53.9, 49, 37.8, 42.7,38.3,45,38.3,38.8))
+                                              
+log.confidence.scores.from.miic$gene <- genes3
+colnames(log.confidence.scores.from.miic) <- c("causality_score","gene") 
+log.confidence.scores.from.miic$lin <- c(rep("M",8))
+
+
+log.confidence.scores.from.miic <- log.confidence.scores.from.miic[order(log.confidence.scores.from.miic$lin,
+                                                                         log.confidence.scores.from.miic$causality_score,
+                                                                         decreasing = F),]
+
+
+
+
+p <- DoHeatmap(haem.seurat, features = log.confidence.scores.from.miic$gene,group.by = "lineage", cells = mature, disp.max = 1.5, disp.min = -1.5,draw.lines = T, lines.width = 2,label = F, group.bar = F)
+p2 <- p +NoLegend() + scale_fill_gradientn(colors = c("blue","white","red"),na.value = "white")
+
+log.confidence.scores.from.miic$gene  <- factor(log.confidence.scores.from.miic$gene, levels = rev(log.confidence.scores.from.miic$gene))
+
+p3 <- ggplot(log.confidence.scores.from.miic,aes(x = gene, y = causality_score))+ geom_bar(stat = "identity", color="black", fill="white")  + theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) + coord_flip()  
+
+
+
+
+
+
+
+mature <- colnames(haem.seurat)[haem.seurat@meta.data$lineage %in% c("Myeloid","Erythroid","M_Prog","E_Prog","MPP")]
+
+
+p <- DoHeatmap(haem.seurat, features = "Sell",group.by = "lineage", cells = mature, disp.max = 1.5, disp.min = -1.5,draw.lines = T, lines.width = 2,label = T, group.bar = T)
+p2 <- p + scale_fill_gradientn(colors = c("blue","white","red"),na.value = "white")
+
+
+
+
+
+
+
+
+
+
+
+library(gridExtra)
+
+tiff("/Users/jasoncosgrove/Desktop/heatmap_causality.tiff", units = "in", width = 6, height = 6, res = 200)
+print(grid.arrange(p2, p3, nrow = 1, ncol = 2,widths = c(60, 20)))
+dev.off()
+
+
+tiff("/Users/jasoncosgrove/Desktop/heatmap_causality.tiff", units = "in", width = 6, height = 9, res = 200)
+mature <- colnames(haem.seurat)[haem.seurat@meta.data$lineage %in% c("Myeloid","Erythroid","Lymphoid","M_Prog","E_Prog","L_Prog")]
+
+genes <- c("Gsr","Pkm","Idh1","Idh2","Hexa","Hk2","G6pdx","Taldo1","Abcd1")
+p <- DoHeatmap(haem.seurat, features = genes,group.by = "lineage", cells = mature, disp.max = 2, disp.min = -2,group.colors = c("red","dark red","yellow","orange","blue","dark blue"))
+p +NoLegend() + scale_fill_gradientn(colors = c("white","grey80","black"),na.value = "white")
+dev.off()
+
+
+immune.genes <- names(GO.sets)[grepl("immune",names(GO.sets))]
+immune.genes <- unique(unlist(GO.sets[immune.genes]))
+
+genes <- rownames(haem.seurat)[1:1000]
+
+
+
+
+# run PCA and UMAP on the dataset using the seurat package
+# inputs: sobj is a seurat object
+#         genes are the genes we use for the dimensionality reduction
+# returns: pca plots and umap plots
+runDimensionalityReduction <- function(sobj, genes){
+  sobj<- RunPCA(object = sobj, npcs = 50, verbose = FALSE, features = genes)
+  sobj  <- RunUMAP(object = sobj, reduction = "pca", dims = 1:25, min.dist = 0.4, spread = 0.4,verbose = FALSE)
+  #visualise pca based dimensionality reduction vs. umap, this is done on all genes!
+  p1 <- DimPlot(object = sobj, reduction = "pca", group.by = "lineage",label.size = 2,  label = F, repel = T)  
+  p2 <- DimPlot(object = sobj, reduction = "umap", group.by = "lineage",label.size = 2,  label = T, repel = T)  
+  return(list(pca = p1,umap = p2))
+}
+
+
+
+
+#now lets run dimensionality reduction and visualisation to see if we have any batch effects in our data
+haem.seurat <- RunPCA(object = haem.seurat, npcs = 50, verbose = FALSE, features = genes)
+haem.seurat  <- RunUMAP(object = haem.seurat, reduction = "pca", dims = 1:50, min.dist = 0.4, spread = 0.4,verbose = FALSE)
+
+#visualise pca based dimensionality reduction vs. umap, this is done on all genes!
+p1 <- DimPlot(object = haem.seurat, reduction = "pca", group.by = "lineage",label.size = 2,  label = F, repel = T)  
+p2 <- DimPlot(object = haem.seurat, reduction = "umap", group.by = "lineage",label.size = 2,  label = T, repel = T)  
+plot_grid(p1, p2)
+
+#save the seurat object to file for later analysis if we need it.
+save(haem.seurat, file = "datasets/Haemopedia/haem_seurat.Rda")
+```
+
+# Mitochondrial genes
+As we are interested in metabolism it is interesting to know how many of our genes
+encode for proteins that localise to the mitochondria using the mitocarta v2 database (4). 
+
+
+```{r mito, eval = FALSE}
+
+mitocarta.genes <- read.csv("genesets/mitochondrial_assoc_genes.csv",header=F)
+
+mito.genes <- intersect(rownames(haem.seurat),mitocarta.genes$V1)
+haem.seurat <- AddModuleScore(haem.seurat, features = list(mito.genes),name = "mito") 
+VlnPlot(haem.seurat, features = "mito1",group.by = "lineage")
+
+mito <- haem.seurat@meta.data$mito1
+names(mito) <- colnames(haem.seurat)
+
+boxplot(mito[c("LSK.1","LSK.2")]  ,  mito[c("CLP.1","CLP.2")] ,mito[c("GMP.1","GMP.2")], mito[c("MEP.1","MEP.2")] )
+
+```
+
+
+# Differential expression analysis
+Lets visualise our differentially expressed genes using a volcano plot. Overlay the expression of metabolic genes.
+
+```{r pressure2}
+
+#specify the contrast matrix that we want to use for our analysis
+cont.matrix <- makeContrasts( E = Erythroid - (Myeloid + Lymphoid) / 2 ,
+                              M = Myeloid - (Erythroid +Lymphoid)  / 2 ,
+                              L = Lymphoid - (Myeloid + Erythroid) / 2 ,
+                              levels = design )
+
+#Now that we have the voom transformed data we can use limma to test for differential expression. First we fit a linear model for each gene using the lmFit function in limma. lmFit needs the voom object and the design matrix that we have already specified, which is stored within the voom object.
+fit <- lmFit(v)
+
+#Now we can apply the contrasts matrix to the fit object to get the statistics and estimated parameters of our comparison that we are interested in. 
+fit.cont <- contrasts.fit(fit, cont.matrix)
+
+#The final step is to call the eBayes function, which performs empirical Bayes shrinkage on the variances, and estimates moderated t-statistics and the associated p-values.
+fit.cont <- eBayes(fit.cont, robust = T, proportion = 0.4)
+
+#print a summary of the results
+summa.fit <- decideTests(fit.cont)
+summary(summa.fit)
+
+#set the contrast names for when we plot the results
+contrast.names <- c("E","M","L")
+
+# get all metabolic genes
+metabolic.genes <- c(metabolic.signatures$allGenesTested)
+
+# do volcano plots for each lineage, overlaying the expression of all metabolic genes
+res.E <- topTable(fit.cont, coef=1, number=nrow(v$E), adjust.method="BH")
+res.E <- res.E[order(res.E$adj.P.Val),]
+nsign.E <- length(which(res.E$adj.P.Val < 0.05))
+nsignfc.E <- length(which(res.E$adj.P.Val < 0.05 & abs(res.E$logFC) > 1))
+LimmaVolcano(res.E)
+
+res.E.filtered <- res.E[res.E$adj.P.Val < 0.05,]
+
+res.M <- topTable(fit.cont, coef=2, number=nrow(v$E), adjust.method="BH")
+res.M <- res.M[order(res.M$adj.P.Val),]
+nsign.M <- length(which(res.M$adj.P.Val < 0.05))
+nsignfc.M <- length(which(res.M$adj.P.Val < 0.05 & abs(res.M$logFC) > 1))
+LimmaVolcano(res.M)
+
+res.M.filtered <- res.M[res.M$adj.P.Val < 0.05,]
+
+res.L <- topTable(fit.cont, coef=3, number=nrow(v$E), adjust.method="BH")
+res.L <- res.L[order(res.L$adj.P.Val),]
+nsign.L <- length(which(res.L$adj.P.Val < 0.05))
+nsignfc.L <- length(which(res.L$adj.P.Val < 0.05 & abs(res.L$logFC) > 1))
+LimmaVolcano(res.L)
+
+res.L.filtered <- res.L[res.L$adj.P.Val < 0.05,]
+
+write.csv(res.L.filtered, "Results/Module1/DEGs_L.csv")
+write.csv(res.E.filtered, "Results/Module1/DEGs_E.csv")
+write.csv(res.M.filtered, "Results/Module1/DEGs_M.csv")
+
+res.M.filtered <- res.M[res.M$adj.P.Val < 0.05 & res.M$logFC > 0,]
+
+genes <- c(res.M.filtered$gene[1:20])
+
+coolmap(v[genes,])
+
+
+```
+
+
+# Gene-set overrepresentation analysis
+Approach 1. Geneset overrepresentation analysis: This works by seeing if your differentially expressed genes occur at a high frequency in a given geneset, relative to chance. The Null hypothesis here is that if a geneset represents 1% of all genes in the experiment then 1% of the genes in the pathway would be differentially expressed. This does assume that genes are independent which has been shown not to be true.  We perform these analyses using the kegga and goana methods available in the limma package. 
+
+
+```{r pressure4, eval = FALSE}
+
+for(i in 1:length(contrast.names)){
+  
+  go <- goana(fit.cont, coef=i,species = "Mm",geneid = haemopedia$entrezgene[rownames(haemopedia$counts) %in% rownames(v$E)])
+  kegg <- kegga(fit.cont, coef=i,species = "Mm",geneid = haemopedia$entrezgene[rownames(haemopedia$counts) %in% rownames(v$E)])
+  
+  go$FDR.up <- p.adjust(go$P.Up, method = "BH", n = length(go$P.Up))
+  go$FDR.down <- p.adjust(go$P.Down, method = "BH", n = length(go$P.Down))
+  
+  kegg$FDR.up <-  p.adjust(kegg$P.Up, method = "BH", n = length(kegg$P.Up))
+  kegg$FDR.down <- p.adjust(kegg$P.Down, method = "BH", n = length(kegg$P.Down))
+
+  #kegg <- kegg[kegg$FDR.up < 0.1 | kegg$FDR.down < 0.1,]
+  #go <- go[go$FDR.up < 0.1 | go$FDR.down < 0.1,]
+  write.csv(go,   paste( "Results/Module1/" ,contrast.names[i],"GOANA_GO_pathways.csv",sep="_"))
+  write.csv(kegg, paste( "Results/Module1/" ,contrast.names[i],"KEGGA_KEGG_pathways.csv",sep="_"))
+}
+
+```
+
+
+Approach 2. Gene set testing: We run two different types of tests: Competitive and self contained, that differ to the genset overrepresentation analysis. Competitive gene set tests, such as those implemented in GOseq and camera (5), ask the question whether the differentially expressed genes tend to be over-represented inthe gene set, compared to all the other genes in the experiment.Self-contained tests, which include the ROAST procedure, ask the question are the genes in the set/pathway differentially expressed as a whole. ROAST tends to be used for smaller amounts of pathways ROAST (6) (FRY is a fast approximation) uses different metrics to summarise geneset expression, we use the default of mean, this option is not available in camera. It works under three different hypotheses, "Up" to test whether the genes in the set tend to be up-regulated, with positive t-statistics, "Down" to test whether the genes in the set tend to be down-regulated, with negative t-statistics, and "Mixed" to test whether the genes in the set tend to be differentially expressed, without regard for direction.
+Competitive null: The genes in the gene set do not have stronger association with the subject condition than other genes. (Approach 1, 2)
+Self-contained null: The genes in the gene set do not have any association with the subject condition (Approach 3).
+
+```{r pressure3, eval = FALSE}
+
+#get the indices of the dataset that correspond to each geneset
+load("genesets/geneset_Robjects/KEGG.Rda")
+KEGG.ind <- ids2indices(KEGG.sets, rownames(v))
+
+for(i in 1:length(contrast.names)){
+  
+  print(contrast.names[i])
+  
+  KEGG.camera <- camera(v,index = KEGG.ind,design=design,contrast = cont.matrix[,i],inter.gene.cor=0.01)
+  KEGG.fry <- mroast(v, index = KEGG.ind, design = design, contrast = cont.matrix[,i], sort = "mixed",set.statistic = "mean50")
+  
+  #KEGG.camera <- KEGG.camera[KEGG.camera$FDR < 0.1,]
+  #KEGG.fry <- KEGG.fry[KEGG.fry$FDR < 0.1,]
+  
+  write.csv(KEGG.camera, paste( "Results/Module1/" , contrast.names[i],"CAMERA_KEGG_pathways.csv",sep="_"))
+  write.csv(KEGG.fry, paste( "Results/Module1/"  , contrast.names[i],"FRY_KEGG_pathways.csv",sep="_"))
+}
+
+
+```
+
+
+
+# References: 
+1. Choi, J. et al. “Haemopedia RNA-Seq: A Database of Gene Expression during Haematopoiesis in Mice and Humans.” Nucleic Acids Research 47, no. D1 (January 8, 2019): D780–85. https://doi.org/10.1093/nar/gky1020.
+
+2. Ritchie, Matthew E. et al. “Limma Powers Differential Expression Analyses for RNA-Sequencing and Microarray Studies.” Nucleic Acids Research 43, no. 7 (April 20, 2015): e47–e47. https://doi.org/10.1093/nar/gkv007.
+
+3. Butler, Andrew et al. Integrating Single-Cell Transcriptomic Data across Different Conditions, Technologies, and Species. Nature Biotechnology 36, no. 5 (May 2018). https://doi.org/10.1038/nbt.4096.
+
+4. Calvo, Sarah E., Karl R. Clauser, and Vamsi K. Mootha. “MitoCarta2.0: An Updated Inventory of Mammalian Mitochondrial Proteins.” Nucleic Acids Research 44, no. D1 (January 4, 2016): D1251–57. https://doi.org/10.1093/nar/gkv1003.
+
+5. Wu, Di, and Gordon K. Smyth. “Camera: A Competitive Gene Set Test Accounting for Inter-Gene Correlation.” Nucleic Acids Research 40, no. 17 (September 1, 2012): e133–e133. https://doi.org/10.1093/nar/gks461.
+
+6. Wu, Di, et al. “ROAST: Rotation Gene Set Tests for Complex Microarray Experiments.” Bioinformatics 26, no. 17 (September 1, 2010): 2176–82. https://doi.org/10.1093/bioinformatics/btq401.
