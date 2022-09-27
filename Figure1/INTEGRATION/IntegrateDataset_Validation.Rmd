@@ -1,0 +1,381 @@
+---
+title: "RNAbarcoding of DRAG mice"
+output: html_document
+author: Jason Cosgrove (jason.cosgrove@curie.fr) 
+---
+
+<style type="text/css">
+
+body{ /* Normal  */
+      font-size: 12px;
+  }
+td {  /* Table  */
+  font-size: 8px;
+}
+h1.title {
+  font-size: 38px;
+  color: DarkRed;
+}
+h1 { /* Header 1 */
+  font-size: 28px;
+  color: DarkBlue;
+}
+h2 { /* Header 2 */
+    font-size: 22px;
+  color: DarkBlue;
+}
+h3 { /* Header 3 */
+  font-size: 18px;
+  font-family: "Times New Roman", Times, serif;
+  color: DarkBlue;
+}
+code.r{ /* Code block */
+    font-size: 12px;
+}
+pre { /* Code block - determines code spacing between lines */
+    font-size: 14px;
+}
+</style>
+
+
+
+
+
+In this study we combine lineage tracing and RNA sequencing to understand the metabolic regulators of hematopoietic stem and progenitor cell differentiation in vivo (MetaFate). 
+
+
+To perofrm metafate, we use the DRAG (Diversity through RAG) barcoding technology that allows endogenous barcoding of cellular lineages in situ in a temporally controlled manner. Specifically, CagCre+/- DRAG+/- mice are given a tamoxifen injection to induce barcode recombination.  Once cells are induced, all offspring of barcoded cells inherit the genetic-label and a GFP tag. As barcode transcripts have a poly(A) tail, they are directly detectable using standard single cell transcriptomics approaches. For each cell we can therefore obtain 3 pieces of information: (i) gene expression data (ii) a cellular barcode (iii) barcode abundance in the myeloid and erythroid lineages. 
+
+Specifically, barcoded LSKs (Sca1+ cKit+ GFP+), Cd11b+ GFP+ Myeloid and Ter119+ CD44+ GFP+ nucleated erythroid cells were isolated from the bone marrow of N mice using fluorescence activated cell sorting (FACS) 50-78 weeks after tamoxifen injection. HSPCs were then processed for single cell RNA sequencing and targeted barcode amplification using a customised version of 10X genomic protocol. In erythroid and myeloid cells, barcodes were detected from bulk cell populations at the DNA level with cells undergoing lysis and a nested PCR reaction. 
+
+In this script we combine information from the transcriptome together with lineage barcodes detected in HSPCs and in peripheral hematopoietic cells.
+
+
+
+
+# Step 1: Prepare the workspace, loading the appropriate packages and reading the data in with associated metadata
+ 
+```{r initialiseWorkspace, message = FALSE, warning = FALSE}  
+#clear the workspace
+rm(list=ls())
+
+knitr::opts_knit$set(root.dir = "/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/JCB4_metabolism_bioinformatics_pipeline")
+
+
+#source("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/MetaFate_final_pipeline/pipeline_scripts/INTEGRATION/helper_methods_refactored.R")
+gene.sets <- read.csv("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/MetaFate_final_pipeline/pipeline_scripts/INTEGRATION/genesets/genesets.csv")
+#set the working directory and load in required libraries
+
+library(Seurat)
+library(scran)
+library(org.Mm.eg.db)
+library(clustree)
+library(dplyr)
+library(enrichR)
+library(ggrepel)
+library(Rmagic)
+library(ggpubr)
+
+
+set.seed(12345)
+
+setwd("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/JCB4_metabolism_bioinformatics_pipeline")
+``` 
+
+
+
+Weinreb and Fraticelli et al.comprises 28,249 cKit+ and cKit+ Sca1+ progenitors that were lentivirally barcoded and cultured for 2 days in vitro. In this analysis cells were classified as M, Mk, E or L biased on whether the majority of cells within that clone are found within the lymphoid, myeloid, megakaryocyte and lymphoid clusters defined in the original publication. Cells that were undifferentiated or that could not be assigned to a lineage in this manner were excluded from further analysis.
+
+```{r weinreb,  eval= TRUE}
+
+#load the preprocessed datasets and signatures
+load("datasets/Weinreb/Weinreb.Rda")
+load('/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/JCB4_metabolism_bioinformatics_pipeline/genesets/geneset_Robjects/metabolic_signatures_metafate.Rda')
+
+
+
+#add the gene signatures to the weinreb seurat object
+weinreb <- AddModuleScore(weinreb , features = list(metabolic.signatures$fate_m),
+                           name = "m_fate",replace = TRUE,assay = "RNA")
+
+weinreb <- AddModuleScore(weinreb , features = list(metabolic.signatures$metafate_m ),
+                           name = "m_metab",replace = TRUE,assay = "RNA")
+
+weinreb <- AddModuleScore(weinreb , features = list(gene.sets$Pia_MPP3),
+                           name = "mpp3",replace = TRUE,assay = "RNA")
+
+
+#we want to focus on the earliest phases of differentiation so we subset on the day 2 dataset
+lsks.cellid <- colnames(weinreb)[weinreb$Time_point == 2 ]
+lsks <- subset(weinreb,cells = lsks.cellid)
+
+
+#we merge all myeloid lineages together
+lsks$clone_fate2 <- lsks$clone_fate
+lsks$clone_fate2[lsks$clone_fate2 == "Monocyte"] <- "Myeloid"
+lsks$clone_fate2[lsks$clone_fate2 == "Neutrophil"] <- "Myeloid"
+lsks$clone_fate2[lsks$clone_fate2 == "Baso"] <- "Myeloid"
+lsks$clone_fate2[lsks$clone_fate2 == "Eos"] <- "Myeloid"
+
+
+#plot a UMAP of the data
+lsks.filtered.cells <- colnames(lsks)[lsks$clone_fate2 == "Myeloid" | lsks$clone_fate2 == "Erythroid" |
+                                        lsks$clone_fate2 == "Meg" | lsks$clone_fate2 == "Lymphoid"]
+lsks.filtered <- subset(lsks,cells = lsks.filtered.cells )
+
+DimPlot(lsks.filtered, reduction = "spring", group.by = "clone_fate2",
+        cols = c( "red","#E69F00","#999999","blue"), pt.size = 0.5) + NoLegend()
+
+
+#plot the results, 
+lsks<- SetIdent(lsks,value = "clone_fate2")
+metab <- VlnPlot(lsks,"m_metab1",pt.size = 0,idents = c("Myeloid","Erythroid","Lymphoid","Meg"))
+all <- VlnPlot(lsks,"m_fate1",pt.size = 0.1,idents = c("Myeloid","Erythroid","Lymphoid","Meg"))
+mpp3 <- VlnPlot(lsks,"mpp31",pt.size = 0.1,idents = c("Myeloid","Erythroid","Lymphoid","Meg"))
+
+
+#plot the expression of the metabolism signature
+p <- ggplot(metab$data, aes(x=m_metab1, y=ident,color=ident)) + 
+  geom_boxplot(lwd = 1.5,show.legend = FALSE)
+p + coord_flip() + scale_color_manual(values=c("blue","#999999", "red", "#E69F00")) + theme_classic() +theme(axis.text=element_text(size=12,face = 'bold'),
+        axis.title=element_text(size=0,face="bold"),
+        axis.line = element_line(size = 1.0, colour = "black")) + ggtitle("Weinreb et al \n MetaFate-myeloid signature")
+
+
+
+p <- ggplot(all$data, aes(x=m_fate1, y=ident,color=ident)) + 
+  geom_boxplot(lwd = 1.5,show.legend = FALSE)
+p + coord_flip() + scale_color_manual(values=c("blue","#999999", "red", "#E69F00")) + theme_classic() +theme(axis.text=element_text(size=12,face = 'bold'),
+        axis.title=element_text(size=0,face="bold"),
+        axis.line = element_line(size = 1.0, colour = "black")) + ggtitle("Weinreb et al \n DRAGFate-myeloid signature")
+
+
+
+#significance testing
+shapiro.test(metab$data$m_metab1)
+shapiro.test(all$data$m_fate1)
+
+pairwise.wilcox.test(metab$data$m_metab1, metab$data$ident,
+                 p.adjust.method = "BH")
+
+pairwise.wilcox.test(all$data$m_fate1, all$data$ident,
+                 p.adjust.method = "BH")
+
+
+```
+
+
+#cKit compartment
+Lets see how our signatures look in the Tusi dataset. Tusi et al Nature (2018).
+Tusi et al  comprises 4,763 cKit+ progenitors. To annotate this dataset we performed unsupervised clustering of the data and supervised annotation using lineage-specific markers provided in supplementary table 1 of the original article
+
+```{r Tusi_dataset, eval= TRUE}
+
+#load the preprocessed dataset
+load("datasets/Tusi/Tusi_seurat_control_only.Rda")
+
+
+#add the signature score
+TusiEPO.control <- AddModuleScore(TusiEPO.control, features = list(metabolic.signatures$metafate_m), name = "M_metafate")
+TusiEPO.control <- AddModuleScore(TusiEPO.control, features = list(metabolic.signatures$fate_m), name = "M_fate")
+
+#SPRING plot of hte data
+DimPlot(TusiEPO.control,reduction = "spring", cols = c("red","blue" ,"grey90","grey50","#E69F00"))
+
+
+# Define an order of cluster identities
+my_levels <- c("M","MEG","E","L")
+
+# Relevel object@ident
+TusiEPO.control@active.ident <- factor(x = TusiEPO.control@active.ident, levels = my_levels)
+
+
+#boxplot comparisons
+sig <- VlnPlot(TusiEPO.control, "M_metafate1", idents = c("L","E","M","MEG"))
+p <- ggplot(sig$data, aes(x=M_metafate1, y=ident,color=ident)) + 
+  geom_boxplot(lwd = 1.5,show.legend = FALSE)
+p + coord_flip() + scale_color_manual(values=c("blue","#999999", "red", "#E69F00")) + theme_classic() +theme(axis.text=element_text(size=12,face = 'bold'),
+        axis.title=element_text(size=0,face="bold"),
+        axis.line = element_line(size = 1.0, colour = "black")) + ggtitle("Tusi et al \n MetaFate-myeloid signature")
+
+
+#significance testing
+shapiro.test(sig$data$M_metafate1)
+pairwise.wilcox.test(sig$data$M_metafate1, sig$data$ident,
+                 p.adjust.method = "BH")
+
+
+
+sig <- VlnPlot(TusiEPO.control, "M_fate1", idents = c("L","E","M","MEG"))
+
+p <- ggplot(sig$data, aes(x=M_fate1, y=ident,color=ident)) + 
+  geom_boxplot(lwd = 1.5,show.legend = FALSE)
+p + coord_flip() + scale_color_manual(values=c("blue","#999999", "red", "#E69F00")) + theme_classic() +theme(axis.text=element_text(size=12,face = 'bold'),
+        axis.title=element_text(size=0,face="bold"),
+        axis.line = element_line(size = 1.0, colour = "black"))  + ggtitle("Tusi et al \n DRAGFate-myeloid signature")
+
+
+#significance testing
+shapiro.test(sig$data$M_fate1)
+
+pairwise.wilcox.test(sig$data$M_fate1, sig$data$ident,
+                 p.adjust.method = "BH")
+
+
+
+
+# How do our signatures change as a function of EPO stimulation?
+load("datasets/Tusi/Tusi_seuratObj.Rda")
+
+#create the signatures
+TusiEPO <- AddModuleScore(TusiEPO, features = list(metabolic.signatures$metafate_m), name = "M_metafate")
+TusiEPO <- AddModuleScore(TusiEPO, features = list(metabolic.signatures$fate_m), name = "M_fate")
+
+
+#metafate
+sig <- VlnPlot(TusiEPO,"M_metafate1",group.by = "batch")
+
+p <- ggplot(sig$data, aes(x=M_metafate1, y=ident,color=ident)) + 
+     geom_boxplot(lwd = 1.5,show.legend = FALSE)
+
+
+p + coord_flip() + scale_color_manual(values=c("red" ,"#56B4E9" ,"#999999","#E69F00")) + theme_classic() + theme(axis.text=element_text(size=12,face = 'bold'),axis.title=element_text(size=0,face="bold"),
+ axis.line = element_line(size = 1.0, colour = "black"))
+
+
+
+#dragfate
+sig <- VlnPlot(TusiEPO,"M_fate1",group.by = "batch")
+
+p <- ggplot(sig$data, aes(x=M_fate1, y=ident,color=ident)) + 
+     geom_boxplot(lwd = 1.5,show.legend = FALSE)
+
+
+p + coord_flip() + scale_color_manual(values=c("red" ,"#56B4E9" ,"#999999","#E69F00")) + theme_classic() + theme(axis.text=element_text(size=12,face = 'bold'),axis.title=element_text(size=0,face="bold"),
+ axis.line = element_line(size = 1.0, colour = "black"))
+                                                                                                      
+```
+
+
+
+
+# Dahlin 
+Dahlin et al comprises 44802 cKit+ and cKit+ Sca1+ hematopoietic progenitors. Cell clustering and supervised assignment of cluster identity were taken from scripts associated with Wolf et al. PAGA paper
+```{r Dahlin, eval= TRUE}
+
+#load the DRAGfate dataset
+load("datasets/Dahlin/Dahlin.Rda")
+
+#add the signature scores
+dahlin  <- AddModuleScore(dahlin, features = list(metabolic.signatures$metafate_m), name = "M_metafate")
+dahlin <- AddModuleScore(dahlin, features = list(metabolic.signatures$fate_m), name = "M_fate")
+
+#plot the data
+DimPlot(dahlin,cols = c("grey90","#E69F00","grey90","red","grey90","blue",
+                        "grey90","grey90","grey60","grey90","grey90")) +NoLegend()
+        
+
+my_levels <- c("M","Mk","E","L")
+
+# Relevel object@ident
+dahlin@active.ident <- factor(x = dahlin@active.ident, levels = my_levels)
+
+#boxplots for metafate
+sig <- VlnPlot(dahlin,"M_metafate1",idents = c("Mk","L","E","M"))
+
+p <- ggplot(sig$data, aes(x=M_metafate1, y=ident,color=ident)) + 
+  geom_boxplot(lwd = 1.5,show.legend = FALSE)
+p + coord_flip() + scale_color_manual(values=c("blue","#999999", "red", "#E69F00")) + theme_classic() +theme(axis.text=element_text(size=12,face = 'bold'),
+        axis.title=element_text(size=0,face="bold"),
+        axis.line = element_line(size = 1.0, colour = "black"))
+
+
+#significance testing
+pairwise.wilcox.test(sig$data$M_metafate1, sig$data$ident,
+                 p.adjust.method = "BH")
+
+
+#boxplots for dragfate
+sig <- VlnPlot(dahlin,"M_fate1",idents = c("Mk","L","E","M"))
+
+#boxplots
+p <- ggplot(sig$data, aes(x=M_fate1, y=ident,color=ident)) + 
+  geom_boxplot(lwd = 1.5,show.legend = FALSE)
+p + coord_flip() + scale_color_manual(values=c("blue","#999999", "red", "#E69F00")) + theme_classic() +theme(axis.text=element_text(size=12,face = 'bold'),
+        axis.title=element_text(size=0,face="bold"),
+        axis.line = element_line(size = 1.0, colour = "black"))
+
+#significance testing
+pairwise.wilcox.test(sig$data$M_fate1, sig$data$ident,
+                 p.adjust.method = "BH")
+
+
+```
+
+
+
+
+
+# Haltalli et al
+Haltalli et al comprises hematopoietic progenitors from plasmodium-infected and control mice. Preprocessing done as in the original article
+
+```{r INFECTION,eval= TRUE}
+
+#load the datasets
+setwd('/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/JCB16_LoCelso_Plasmodium_Infection/wetransfer-2a31f3')
+
+data.combined <- readRDS('processed_dataset_LoCelso.rds')
+
+
+# Run the standard workflow for visualization and clustering
+data.combined <- ScaleData(data.combined, verbose = FALSE)
+
+#PCA plot
+DimPlot(data.combined,group.by = "clusters",dims = c(1,2), 
+        cols = c("grey","grey","grey","grey","grey","grey","grey"))
+
+#add signature scores
+DefaultAssay(data.combined) <- "RNA"
+data.combined <- AddModuleScore(data.combined, features =  list(metabolic.signatures$metafate_m),
+                                name = "m_metab",assay = "RNA")
+
+data.combined <- AddModuleScore(data.combined, features =  list(metabolic.signatures$fate_m),
+                                name = "m_fate",assay = "RNA")
+
+
+#plot the expression of signatures and markers
+FeaturePlot(data.combined, features = c("m_metab1"),max.cutoff = "q95", min.cutoff = "q5", cols = c("black","red") ,ncol = 1)
+FeaturePlot(data.combined, features = "Sell",max.cutoff = "q95", min.cutoff = "q5", cols = c("black","red") )
+
+
+#plot metafate myeloid signature across all cells
+VlnPlot(data.combined,"m_metab1",group.by = "condition",pt.size = 0)
+
+# now subset the data to only look at HSPCs (as defined in original paper)
+hspc.cells <- rownames(data.combined@meta.data)[data.combined$clusters == "4 Primitive HSPC"]
+hspc <- subset(data.combined, cells = hspc.cells)
+
+
+#add signature scores
+hspc <- AddModuleScore(hspc, features =  list(metabolic.signatures$metafate_m),
+                                name = "m_metab",assay = "RNA")
+
+hspc <- AddModuleScore(hspc, features =  list(metabolic.signatures$fate_m),
+                                name = "m_fate",assay = "RNA")
+
+#Vln plots of expression
+VlnPlot(hspc,"m_metab1",group.by = "condition",pt.size = 0,assay = "RNA",adjust = 0.9)
+VlnPlot(hspc,"m_fate1",group.by = "condition",pt.size = 0,assay = "RNA",adjust = 0.9)
+
+#save object to file
+saveRDS(data.combined, "processed_dataset_LoCelso.rds")
+
+#write results to file so we can plot in prism
+df <- VlnPlot(data.combined,"m_metab1",group.by = "condition",pt.size = 1,assay = "RNA")
+write.csv(df$data,"/Users/jasoncosgrove/Desktop/metafate_allckit.csv")
+
+```
+
+
+
+

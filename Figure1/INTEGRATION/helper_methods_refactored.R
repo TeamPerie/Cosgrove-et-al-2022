@@ -175,6 +175,54 @@ setLineageBias <- function(diff.active,E_threshold = 0.25,M_threshold = 0.75){
 }
 
 
+updateMetabolicSignature <- function(metabolic.signatures){
+  
+  pathways <- c("Oxidative phosphorylation" ,  
+                "Proteasome" ,
+                "Pentose phosphate pathway",  
+                "Ribosome biogenesis in eukaryotes",
+                "Citrate cycle (TCA cycle)",
+                "Glutathione metabolism",
+                "Glycolysis / Gluconeogenesis",
+                "Glycosphingolipid biosynthesis",
+                'Ribosome','Proteasome',
+                'Pyrimidine metabolism',
+                'Glyoxylate and dicarboxylate metabolism')
+  
+  
+  #depending on which version of the kegg database we use we might get slightly different genes, 
+  #here we take metabolically associated genes from our pathway analysis just to be sure that they
+  #are included in the final definition of metabolic genes
+  metab.genes <- unlist(strsplit(kegg$pos[kegg$pos$KEGG_2019_Mouse.Term %in% pathways,]$KEGG_2019_Mouse.Genes , ";"))
+  
+  metab.genes <- str_to_title(metab.genes) 
+  
+  metabolic.signatures$allGenesTested <- c(metabolic.signatures$allGenesTested,metab.genes)
+  
+  return(metabolic.signatures)
+}
+
+
+plotPermutationResults <- function(sims,fate_rho,metafate_rho,mpp3_rho,tf_rho){
+  df <- data.frame(x = rep("Fate-Myeloid",sims),y = m.perm)
+  df <- rbind(df, data.frame(x = rep("MetaFate-Myeloid",sims),y = m.metab.perm))
+  df <- rbind(df, data.frame(x = rep("Transcription Factor-Myeloid",sims),y = m.tf.perm))
+  df <- rbind(df, data.frame(x = rep("MPP3",sims),y =  mpp3.perm))
+  
+  
+  
+  pointdata <- data.frame(x = c("Fate-Myeloid","MetaFate-Myeloid","Transcription Factor-Myeloid","MPP3"),y = c(fate_rho,metafate_rho,tf_rho,mpp3_rho))
+  
+  df$x <- factor(df$x,levels = c("Fate-Myeloid","MetaFate-Myeloid","Transcription Factor-Myeloid","MPP3"))
+  
+  ggplot(df,aes(x,y,color = x )) + geom_jitter(width = 0.25,color = rgb(0,0,1,0.3),size = 2)+ coord_flip() + theme_classic() +theme(axis.text=element_text(size=15,face = 'bold',colour = "black"),
+                                                                                                                                    axis.title=element_text(size=0,face="bold"), axis.line = element_line(size = 1.0, colour = "black"),
+                                                                                                                                    axis.ticks.length=unit(.25, "cm")) + geom_point(data = pointdata,  mapping = aes(x = x, y = y,size = 3) , 
+                                                                                                                                                                                    color = "red") + NoLegend()
+  
+  
+}
+
 
 setDiffBias <- function(bc){
   
@@ -354,6 +402,163 @@ number_of_cells_per_threshold <- function(diff.active){
 
 
 
+
+volcanoPlotHSPC2 <- function(res,gene.list){
+  res$gene <- rownames(res)
+  
+  res$sign <- 0
+  
+  
+  res$sign[which(res$minimump_p_val < 0.05 & res$avg_log2FC > 0.1 & res$gene %in% metabolic.signatures$allGenesTested)] <- 2
+  res$sign[which(res$minimump_p_val < 0.05 & res$avg_log2FC < -0.1 & res$gene %in% metabolic.signatures$allGenesTested)] <- 1
+  res$minimump_p_val[res$minimump_p_val == 0] <- 1e-312
+  
+  p <- ggplot(data=res, aes(x=avg_log2FC, y=-log10(minimump_p_val), colour=as.factor(sign))) + geom_point( size=1) +
+    scale_color_manual(name="", values=c("1" = "red","2" = rgb(67/255,138/255,201/255,1),"3"=rgb(128/255,128/255, 128/255,0.4), "0"=rgb(220/255,220/255, 220/255,0.4))) +  
+    theme(legend.position = "none") + xlim(-1.4,1.4) + 
+    xlab("log2 fold change") + ylab("-log10 pvalue") + 
+    geom_vline(xintercept=c(-0.1, 0.1), linetype=2,colour = "grey70") + 
+    geom_hline(yintercept=-log10(0.05), linetype=2,colour = "grey70") 
+  
+  p <- p  + theme(
+    text = element_text(size = 20),
+    # Remove panel border
+    panel.border = element_blank(),  
+    # Remove panel grid lines
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    # Remove panel background
+    panel.background = element_blank(),
+    # Add axis line
+    axis.line = element_line(colour = "grey")
+  ) +geom_text_repel(data=res[gene.list,],aes(label=gene),fontface = "bold",color = "black",min.segment.length = unit(0, 'lines'),size = 5)
+  
+  
+  return(p)
+  
+}
+
+
+
+
+makeSignatures <- function(bc.train,bc.test){
+  m <- FindConservedMarkers(bc.train,ident.1 = "M", ident.2= c("E","diff_inactive"),grouping.var = 'orig.ident',test.use = "wilcox",logfc.threshold = 0.001,meta.method = metap::sumlog)
+  
+  m$avg_log2FC <-  rowMeans(m[,grepl('log2FC',colnames(m))])
+  
+  m.filtered <- m[m$minimump_p_val<= 0.05  & 
+                    rowMeans(m[,grepl('log2FC',colnames(m))]) > 0.1 ,]
+  
+  
+  bc.test<- AddModuleScore(bc.test, features = list(rownames(m.filtered)),
+                           name = "test",replace = TRUE,assay = "RNA")
+  
+  
+  m.metab <- intersect(c(metabolic.signatures$allGenesTested),
+                       c(rownames(m.filtered)))
+  
+  bc.test<- AddModuleScore(bc.test, features = list(m.metab),
+                           name = "testmetab",replace = TRUE,assay = "RNA")
+  
+  
+  m.tf <- intersect(TF.genes,rownames(m.filtered))
+  
+  bc.test<- AddModuleScore(bc.test, features = list(m.tf),
+                           name = "testtf",replace = TRUE,assay = "RNA")
+  
+  
+  return(bc.test)
+}
+
+
+saveCorrelations <- function(i,bc.test,mat){
+  
+  mat[i,1] <- cor.test( bc.test$test1,
+                        bc.test$bias.score, method = "spearman")$estimate
+  
+  mat[i,2] <- cor.test( bc.test$testtf1,
+                        bc.test$bias.score, method = "spearman")$estimate
+  
+  mat[i,3] <- cor.test( bc.test$testmetab1,
+                        bc.test$bias.score, method = "spearman")$estimate
+
+  
+  mat[i,4] <- cor.test( bc.test$WilsonMolO1,
+                        bc.test$bias.score, method = "spearman")$estimate
+  
+  mat[i,5] <- cor.test( bc.test$MPP2_Pietras1,
+                        bc.test$bias.score, method = "spearman")$estimate
+  
+  
+  mat[i,6] <- cor.test( bc.test$MPP3_Pietras1,
+                        bc.test$bias.score, method = "spearman")$estimate
+  
+  mat[i,7] <- cor.test( bc.test$MPP4_Pietras1,
+                        bc.test$bias.score, method = "spearman")$estimate
+  
+  return(mat)
+  
+  
+}
+
+
+
+K_fold_cross_validation <- function(nfold,seed,bc.subset){
+  
+  set.seed(seed)
+  nfold <- 4
+  
+  flds <- createFolds(colnames(bc.subset), k = nfold, list = TRUE, returnTrain = FALSE)
+  
+  
+  mat <- matrix(0,ncol = 7,nrow = nfold)
+  colnames(mat) <- c("allgenes","tf","metab","hsc","mpp2","mpp3","mpp4")
+  
+  
+  
+  for(i in 1:nfold){
+    
+    #sample_size = floor(0.75*ncol(bc.subset))
+    
+    test = colnames(bc.subset)[flds[i][[1]]]
+    train = colnames(bc.subset)[unlist(flds[-i])]
+    
+    bc.train <- subset(bc.subset, cells = train)
+    bc.test <- subset(bc.subset, cells = test)
+    
+    bc.test <- makeSignatures(bc.train,bc.test)
+    
+    mat <- saveCorrelations(i,bc.test,mat)
+    
+  }    
+  
+  return(mat)
+  
+}
+
+
+
+
+clusterSensitivityAnalysis <- function(dataset.integrated){
+  
+  dataset.integrated <- FindNeighbors(object = dataset.integrated, 
+                                      dims = 1:10,reduction = "pca",
+                                      verbose = TRUE,force.recalc = TRUE)
+  
+  algo <- 1
+  
+  for(i in seq(from=0.1, to=1.0, by=0.1)){
+    dataset.integrated <- FindClusters(object = dataset.integrated, resolution = i,algorithm = algo, verbose = FALSE)
+    
+  }    
+  
+  p <- clustree(dataset.integrated)
+  plot(p)
+  return(dataset.integrated)
+  
+}
+
+
 #generate a volcano plot to visualise DEGs
 volcanoPlotHSPC <- function(res,gene.list){
   res$gene <- rownames(res)
@@ -390,6 +595,38 @@ volcanoPlotHSPC <- function(res,gene.list){
   
 }
 
+
+
+
+
+
+
+
+
+permutationTestMIC <- function(gene.set,sobj,metric,simRuns = 100){
+  
+  output.bias.rho <- matrix(0,ncol = 1, nrow = simRuns)
+  gene.set.size <- length(gene.set)
+  
+  for(i in 1:simRuns){
+    
+    Sys.sleep(0.1)
+    set.seed(1245 * i)
+    
+    gene.index <- sample(1:nrow(sobj), gene.set.size, replace=FALSE)
+    temp.gene.set <- rownames(dataset.integrated)[gene.index]
+    
+    sobj <- AddModuleScore(sobj,features = list(temp.gene.set), name = "temp")
+    cor <- mine( sobj$temp1,sobj@meta.data[,metric])$MIC
+    
+    output.bias.rho[i] <- cor
+    
+  }
+  
+  return(output.bias.rho)
+  
+}
+
 permutationTest <- function(gene.set,sobj,metric,simRuns = 100){
   
   output.bias.rho <- matrix(0,ncol = 1, nrow = simRuns)
@@ -417,22 +654,52 @@ permutationTest <- function(gene.set,sobj,metric,simRuns = 100){
 
 
 
-plotPermutationResults <- function(){
-  df <- data.frame(x = rep("Fate-Myeloid",200),y = m.perm)
-  df <- rbind(df, data.frame(x = rep("MetaFate-Myeloid",200),y = m.metab.perm))
-  df <- rbind(df, data.frame(x = rep("Transcription Factor-Myeloid",200),y = m.tf.perm))
-  df <- rbind(df, data.frame(x = rep("MPP3",200),y =  mpp3.perm))
+plotPermutationResults <- function(sims,fate_rho,metafate_rho,mpp3_rho,tf_rho){
+  df <- data.frame(x = rep("Fate-Myeloid",sims),y = m.perm)
+  df <- rbind(df, data.frame(x = rep("MetaFate-Myeloid",sims),y = m.metab.perm))
+  df <- rbind(df, data.frame(x = rep("Transcription Factor-Myeloid",sims),y = m.tf.perm))
+  df <- rbind(df, data.frame(x = rep("MPP3",sims),y =  mpp3.perm))
+
   
   
-  pointdata <- data.frame(x = c("Fate-Myeloid","MetaFate-Myeloid","Transcription Factor-Myeloid","MPP3"),y = c(0.34,0.29,0.27,0.2))
+  pointdata <- data.frame(x = c("Fate-Myeloid","MetaFate-Myeloid","Transcription Factor-Myeloid","MPP3"),
+                          y = c(fate_rho,metafate_rho,tf_rho,mpp3_rho))
   
-  df$x <- factor(df$x,levels = c("Fate-Myeloid","MetaFate-Myeloid","Transcription Factor-Myeloid","MPP3"))
+  df$x <- factor(df$x,levels = c("Fate-Myeloid","MetaFate-Myeloid","Transcription Factor-Myeloid","MPP3","MPP3_pietras"))
   
-  ggplot(df,aes(x,y,color = x )) + geom_jitter(width = 0.25,color = rgb(0,0,1,0.3),size = 2)  
-  + coord_flip() + theme_classic() +theme(axis.text=element_text(size=15,face = 'bold',colour = "black"),
+  ggplot(df,aes(x,y,color = x )) + geom_jitter(width = 0.25,color = rgb(0,0,1,0.3),size = 2)+ coord_flip() + 
+    theme_classic() +theme(axis.text=element_text(size=15,face = 'bold',colour = "black"),
     axis.title=element_text(size=0,face="bold"), axis.line = element_line(size = 1.0, colour = "black"),
     axis.ticks.length=unit(.25, "cm")) + geom_point(data = pointdata,  mapping = aes(x = x, y = y,size = 3) , 
                                                     color = "red") + NoLegend()
   
   
 }
+
+plotClusterSensitivity <- function(dataset.integrated,all.barcoded.cells ,bc){
+  
+  s <- subset(dataset.integrated,cells = all.barcoded.cells)
+  df <- (table( bc$bias ,s$integrated_snn_res.0.1))
+  opar <- par(lwd = 2)
+  barplot(t(t(df) /colSums(df)),legend = TRUE,col = c("grey50","red","blue","grey90"),
+          xlab = "cluster index",ylab = "proportional representation in cluster",
+          main = "clustering resolution = 0.1",
+          args.legend = list(x = "topleft"))
+  
+  
+  df <- (table( bc$bias ,s$integrated_snn_res.0.4))
+  opar <- par(lwd = 2)
+  barplot(t(t(df) /colSums(df)),legend = F,col = c("grey50","red","blue","grey90"),
+          xlab = "cluster index",ylab = "proportional representation in cluster",
+          main = "clustering resolution = 0.4")
+  
+  
+  df <- (table( bc$bias ,s$integrated_snn_res.0.8))
+  opar <- par(lwd = 2)
+  barplot(t(t(df) /colSums(df)),legend = F,col = c("grey50","red","blue","grey90"),
+          xlab = "cluster index",ylab = "proportional representation in cluster",
+          main = "clustering resolution = 0.8")
+  
+}
+
+

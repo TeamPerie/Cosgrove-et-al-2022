@@ -1,0 +1,580 @@
+---
+title: "MetaFate: Data Analysis"
+output: html_document
+author: Jason Cosgrove (jason.cosgrove@curie.fr) 
+---
+
+<style type="text/css">
+
+body{ /* Normal  */
+      font-size: 12px;
+  }
+td {  /* Table  */
+  font-size: 8px;
+}
+h1.title {
+  font-size: 38px;
+  color: DarkRed;
+}
+h1 { /* Header 1 */
+  font-size: 28px;
+  color: DarkBlue;
+}
+h2 { /* Header 2 */
+    font-size: 22px;
+  color: DarkBlue;
+}
+h3 { /* Header 3 */
+  font-size: 18px;
+  font-family: "Times New Roman", Times, serif;
+  color: DarkBlue;
+}
+code.r{ /* Code block */
+    font-size: 12px;
+}
+pre { /* Code block - determines code spacing between lines */
+    font-size: 14px;
+}
+</style>
+
+
+
+
+
+In this study we combine lineage tracing and RNA sequencing to understand the metabolic regulators of hematopoietic stem and progenitor cell differentiation in vivo (MetaFate). 
+
+
+To perofrm metafate, we use the DRAG (Diversity through RAG) barcoding technology that allows endogenous barcoding of cellular lineages in situ in a temporally controlled manner. Specifically, CagCre+/- DRAG+/- mice are given a tamoxifen injection to induce barcode recombination.  Once cells are induced, all offspring of barcoded cells inherit the genetic-label and a GFP tag. As barcode transcripts have a poly(A) tail, they are directly detectable using standard single cell transcriptomics approaches. For each cell we can therefore obtain 3 pieces of information: (i) gene expression data (ii) a cellular barcode (iii) barcode abundance in the myeloid and erythroid lineages. 
+
+Specifically, barcoded LSKs (Sca1+ cKit+ GFP+), Cd11b+ GFP+ Myeloid and Ter119+ CD44+ GFP+ nucleated erythroid cells were isolated from the bone marrow of N mice using fluorescence activated cell sorting (FACS) 50-78 weeks after tamoxifen injection. HSPCs were then processed for single cell RNA sequencing and targeted barcode amplification using a customised version of 10X genomic protocol. In erythroid and myeloid cells, barcodes were detected from bulk cell populations at the DNA level with cells undergoing lysis and a nested PCR reaction. 
+
+In this script we combine information from the transcriptome together with lineage barcodes detected in HSPCs and in peripheral hematopoietic cells.
+
+
+
+
+# Step 1: Prepare the workspace, loading the appropriate packages and reading the data in with associated metadata
+ 
+```{r initialiseWorkspace, message = FALSE, warning = FALSE}  
+#clear the workspace
+rm(list=ls())
+#set the working directory and load in required libraries
+setwd("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/MetaFate_final_pipeline/pipeline_scripts/INTEGRATION/")
+library(Seurat)
+library(scran)
+library(org.Mm.eg.db)
+library(clustree)
+library(dplyr)
+library(enrichR)
+library(ggrepel)
+library(ggpubr)
+library(caret)
+library(stringr)
+source("helper_methods_refactored.R")
+set.seed(12345)
+
+load('genesets/metabolic_signatures.Rda')
+
+load("genesets/GO.Rda")
+
+TF.genes <- unique(unlist(GO.sets[names(GO.sets)[grepl("transcription factor",names(GO.sets))]]))
+
+``` 
+
+
+
+# Step 1. Linear Dimensionality Reduction
+We perform dimensionality reduction on variably expressed genes using both principle component analysis, an approach to find the linear combination of genes that are the greatest source of variance in the data.
+
+Based on an elbow plot visualisation of the data, the first 10-15 PCs capture the majority of the variance in our integrated dataset. This is important later on when we decide how many PCs we use for clustering and UMAP visualistion of the data. 
+
+```{r dimension_reduction, message = FALSE, warning = FALSE}  
+
+dataset.integrated <- readRDS("Robjects/sobj_integrated.Rda")
+
+
+#first lets run PCA on the data
+dataset.integrated <- ScaleData(dataset.integrated, verbose = FALSE)
+dataset.integrated <- RunPCA(dataset.integrated, npcs = 30, verbose = FALSE)
+
+ElbowPlot(dataset.integrated,ndims = 30)
+VizDimLoadings(dataset.integrated, dims = 1:4, reduction = "pca",nfeatures = 20)
+
+DimPlot(dataset.integrated, reduction = "pca", group.by = "phases",dims=c(1,2))
+DimPlot(dataset.integrated, reduction = "pca", group.by = "orig.ident",dims=c(1,2))
+
+```
+
+
+Let's see how the barcodes are distributed in PCA space
+
+
+```{r overlay_bc_info, message = FALSE, warning = FALSE} 
+
+all.barcoded.cells <-  colnames(dataset.integrated)[dataset.integrated$barcoded == TRUE]
+
+DimPlot(object = dataset.integrated, label = T,reduction = "pca", pt.size = 1.0,group.by = "barcoded",cells.highlight = all.barcoded.cells,cols = c("light grey", "light blue"), cols.highlight = "dark red", sizes.highlight = 1.2,label.size = 0,dims=c(1,2)) + NoLegend()
+
+```
+
+
+# Step 2. Non-Linear Dimensionality Reduction
+
+We visualize our data using the non-linear dimensionality reduction technique UMAP. This approach is analogous to PCA, but can also identify non-linear patterns in the data. The goal of the algorithm is to learn the underlying manifold of the data in order to place similar cells together in low-dimensional space. UMAP is preferable to t-SNE as it is faster to compute, and better captures local vs long range distances in the data. 
+```{r UMAP, message = FALSE, warning = FALSE} 
+
+dataset.integrated <- RunUMAP(dataset.integrated, dims = 1:15,reduction = "pca",spread = 60) 
+
+DimPlot(dataset.integrated, reduction = "umap", group.by = "orig.ident",pt.size = 1)
+
+FeaturePlot(dataset.integrated, reduction = "umap", 
+            features = c("nFeature_RNA","nCount_RNA","percent.mt"),
+            dims =c(1,2),min.cutoff = "q1", max.cutoff = "q99")
+
+
+DimPlot(dataset.integrated, group.by = "phases",reduction = "umap",split.by = "phases", cols =c("plum", "cornflowerblue", "darkolivegreen3")) 
+
+DimPlot(dataset.integrated, group.by = "orig.ident",reduction = "umap",split.by = "orig.ident",cols = c("light grey", "cornflowerblue", "darkolivegreen3","orange", "plum")) 
+
+DimPlot(object = dataset.integrated, label = T,reduction = "umap", pt.size = 1.0,group.by = "barcoded",cells.highlight = all.barcoded.cells,cols = c("grey80", "green"), cols.highlight = "dark red", sizes.highlight = 1.0,label.size = 0,dims=c(1,2)) + NoLegend()
+
+
+```
+
+
+#Step 3. Supervised annotation of the data using published gene signatures
+
+Here we use gene sets from the literature to define regions of interest on our UMAP
+
+```{r supervised_annotation, message = FALSE, warning = FALSE} 
+
+gene.sets <- read.csv("genesets/genesets.csv")
+
+dataset.integrated <- geneSignatureScoring(dataset.integrated, gene.sets, colnames(gene.sets),assay = "RNA")
+
+FeaturePlot(object = dataset.integrated, features = c("WilsonMolO1", 
+            "Pia_MPP21","Pia_MPP31","Pia_MPP41"), pt.size = 1.0,
+            min.cutoff = "q5",max.cutoff = "q95", 
+            cols = c("grey90","black"))
+
+```
+
+
+#Step 20. Annotate barcoded cells
+
+```{r set_diff_active, message = FALSE, warning = FALSE} 
+
+diff.active.barcoded.cells <- colnames(dataset.integrated)[rowSums(dataset.integrated@meta.data[,c("Myeloid","Erythroid")]) > 0]
+
+diff.inactive.barcoded.cells <- colnames(dataset.integrated)[rowSums(dataset.integrated@meta.data[,c("Myeloid","Erythroid")]) == 0]
+
+
+diff.active <- subset(dataset.integrated,cells = diff.active.barcoded.cells)
+diff.inactive <- subset(dataset.integrated,cells = diff.inactive.barcoded.cells)
+
+```
+
+
+# Classifying barcoded cells into different functional categories. 
+
+Using DNA barcode measurements in mature cells we define a bias score for differentiation active progenitors. This is calculated by dividing barcode frequency in Myeloid lineage by the sum of barcode frequencies across the myeloid and erythroid lineages
+
+```{r set_bias_score, message = FALSE, warning = FALSE} 
+
+diff.active$bias.score <- diff.active@meta.data$Myeloid/ (diff.active@meta.data$Myeloid + diff.active@meta.data$Erythroid)
+
+
+
+dataset.integrated$bias.score <- 0
+dataset.integrated@meta.data[colnames(diff.active),]$bias.score <- diff.active@meta.data$bias.score 
+
+FeaturePlot(diff.active,"bias.score",min.cutoff = "q20", max.cutoff = "q80", 
+            cols = c("black","green"))
+
+```
+
+Now we have calculated a lineage bias score we should set a threshold value for cells that are considered lineage restricted. To determine what threshold value might be most appropriate we perform a sensitivity analysis looking at how our differential gene expression results (comparing myeloid biased vs erythroid  biased and differntiation inactive barcoded cells) change as a function of threshold value. Specifically we look at the number of DEGs for each threshold value, we look at the log2FC of gene expression and we look at how many cells are classified in each setting. 
+
+```{r diffThresholds, message = FALSE, warning = FALSE} 
+
+fp <- '/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/MetaFate_final_pipeline/data/Step6_10X_Data_integration/outputs/bias_threshold_sensitivity_analysis/'
+
+
+number_of_DEGs_per_threshold(fp)
+
+DEGs_overlap(fp)
+
+log2FC_per_threshold(fp) 
+
+number_of_cells_per_threshold(diff.active)
+
+
+```
+
+Based on this sensitivity analysis we see that stricter thresholds lead to more DEGs and greater effect sizes. However this comes at a price as we also have less cells belonging to each category.  0.75 seems to be a good compromise between these conflicting factors. Consequently in downstream analyses any barcode that has a bias score of 0.75 or above is considered myeloid, any barcode that has a bias score of 0.25 or below is considered erythroid, and anything in between is unbiased (has RNA and DNA barcodes).
+
+To have an intuitive feel for what these threshold means we take a toy example where a barcode has a bias score of 0.8. This means that if we take the sum of the fractional contributions across lineage, myeloid would account for 80% of that. e.g. our barcode is measured 4 times more frequently on a proportional scale in M than in E
+
+```{r set_bias_classifier, message = FALSE, warning = FALSE} 
+
+
+#plot the distribution of bias scores and overlay our thresholds in red
+hist(diff.active$bias.score)
+abline(v=quantile(diff.active$bias.score,0.75),col="red",lwd=4)
+abline(v=quantile(diff.active$bias.score,0.25),col="red",lwd=4)
+
+#set a lineage bias parameter in metadata using these thresholds
+diff.active <- setLineageBias(diff.active, 0.25,0.75)
+
+#lets overlay lineage bias information onto a scatter plot of DNA barcode expression
+ggplot(data = diff.active@meta.data, aes(asinh(Myeloid_cellnorm), asinh(Erythroid_cellnorm), colour = bias))+ 
+  geom_point()
+
+#lets overlay lineage bias information onto the UMAP visualisation of the data
+DimPlot(diff.active,group.by = "bias", reduction = "umap")
+
+
+```
+
+
+A limitation of our previous classifier is that our unbiased subset actually has two phenotypically distinct subgroups of cells. Differentiation active - lineage unbiased barcodes which have RNA and DNA barcodes and DNA barcodes are found across E and M lineages. We also have Differentiation Inactive barcodes which were measured at the RNA level but not the DNA level. These barcodes may be from cells that are not actively differentiating or are not producing cells at a high enough rate that we can detect it. In this section we create a parameter that describes these classes of cells. 
+
+
+```{r set_bias_classifier2, message = FALSE, warning = FALSE} 
+
+bc <- subset(dataset.integrated,cells = all.barcoded.cells)
+bc <- setDiffBias(bc)
+
+bc <- SetIdent(bc,value = "bias")
+table(bc@meta.data$bias)
+table(bc@meta.data$bias,bc$orig.ident)
+
+```
+
+
+Now we have classified the different types of barcoded cells we can see how they are distributed on our UMAP embedding of the data
+
+```{r density_plots, message = FALSE, warning = FALSE} 
+
+bc.subset <- subset(bc,cells = colnames(bc)[bc$bias != "unbiased"])
+DimPlot(object = bc.subset, label = F,reduction = "umap", pt.size = 2.0,group.by = "bias",dims=c(1,2),
+        cols = c("grey30","red","blue","grey80"),ncol = 1) + NoLegend()
+
+Idents(object = bc) <- "bias"
+di <- subset(bc,idents = c("diff_inactive"))
+e <- subset(bc,idents = c("E"))
+m <- subset(bc,idents = c("M"))
+
+p1 <- createDensityPlot(di, bins = 50) + NoLegend()
+p2 <- createDensityPlot(e, bins = 50) + NoLegend()
+p3 <- createDensityPlot(m,bins = 50) + NoLegend()
+
+
+ggarrange(p1, p2,p3,ncol = 1, nrow = 3)
+
+
+```
+
+From our UMAP and density plots we see that differenitation active overlap mostly with the signature for quiescent stem cells while there is an overlap between E and M differentiation active which are found throughout the MPP compartment.To further explore this phenomenon we can perform an unsupervised clustering analysis
+
+
+# Step 18. Unsupervised clustering
+
+To look at how our barcodes are distributed throughout the data  we perform clustering using Seurats default approach. Briefly, this approach involves embedding cells in a graph structure such as a K-nearest neighbour graph, with edges drawn between cells with similar feature expression patterns, and then attempts to partition this graph into a number of highly interconnected subgroups. As LSK cells do not form discrete clusters, but rather show a smooth continuum of expression, our clustering results were sensitive to the resolution parameter of Seurats clustering algorithm. We do see from the clustree plot that there are  6 major subgroups of cells
+
+
+Looking at the plots we see a lot of erythroid and myeloid associated barcodes within the clusters 0 and 1. This suggests that most of the differentiation active HSPCs are found in these clusters. CHanging the resolution parameter of the algorithm doesnt seem to further separate out the myeloid and the erythroid progenitors
+
+
+
+```{r clusterSensitivity, message = FALSE, warning = FALSE} 
+
+
+dataset.integrated <- clusterSensitivityAnalysis(dataset.integrated)
+
+plotClusterSensitivity(dataset.integrated,all.barcoded.cells ,bc)
+
+
+```
+
+Here we see that clustering analysis gives similar results to our density map projections. There is a clear distinction between differentation active vs inactive cells but it is not possible to highly enrich for M-biased vs E-biased differentiation active cells using unsipervised clustering of gene expression measurements
+
+#Step 4. Assess the frequencyof  repeat barcode usage
+
+It is possible during recombination that two independent cells get the same label. We use the IGOR probability model and the frequency of barcode occurrences across mice to estimate how frequently this occurs. This will enable us to see if we should any additional filters to the data before proceeding to downstream statistical analyses. 
+
+
+```{r pgen, message = FALSE, warning = FALSE} 
+
+hist(bc$pgen, main = "distribution of pgen values")
+
+
+df <- VlnPlot(bc,"pgen",group.by = "bias")
+ggplot(df$data, aes(x = ident, y  = pgen,color=ident)) + geom_boxplot() + geom_jitter() +theme(axis.text=element_text(size=15),
+        axis.title=element_text(size=20,face="bold")) + NoLegend()
+
+
+#calculate the repeat use of barcodes across mice
+repeat.use <- table(bc$Con.seq,bc$orig.ident)
+repeat.use.barcodes <- rownames(repeat.use[rowSums(repeat.use != 0) > 1,])
+repeat.use.frequency <- rowSums(repeat.use != 0)
+
+
+ru.freq <- c()
+for(i in 1:nrow(bc@meta.data)){
+  ru.freq <- c( ru.freq,repeat.use.frequency[bc@meta.data[i,]$Con.seq])
+}
+
+bc$repeat.use <- ru.freq
+
+table(bc$repeat.use,bc$bias)
+
+barplot(rowSums(table(bc$repeat.use,bc$bias)), xlab = "number of individuals with same barcode", main = "repeat use frequency",cex.axis = 1.4, cex.lab = 1.8, cex = 1.4)
+
+#quantify repeat use in the classes that are not unbiased
+barplot(rowSums(table(bc$repeat.use,bc$bias)[,1:3]), xlab = "number of individuals with same barcode", main = "repeat use frequency")
+
+
+plot( bc$pgen, bc$repeat.use, ylab = "number of individuals with same barcode", xlab = "generation probability", cex = 2, col = "red",cex.axis = 1.4, cex.lab = 1.8)
+
+
+
+```
+
+It is important to note that repeat use barcodes are troublesome because a cell can appear multipotent when in fact this is not the case. Because we use a classifier approach that focused on lineage restricted cells in our analysis there is a low probability that repeat use barcodes will be lineage restricted. Because we set a strict threshold for lineage bias it is not necessary to filter on pgen values for downstream analyses. Consequently we do not apply any additional filters to the data at this point
+
+
+# Step 5. Differential expression testing between biased clones
+Based on our above bias classifier lets perform differential expression testing to identify key genes of interest for myeloid biased progenitors. Genes that are upregulated in M-biased are grouped into a signature known as DRAG-Fate that will be used in downstream analysis
+
+```{r DEGs, message = FALSE, warning = FALSE} 
+
+bc <- SetIdent(bc,value = "bias")
+diff.active <- SetIdent(diff.active,value = "bias")
+bc@active.assay <- 'RNA'
+
+#dont set a logfc threshold here, set it after on the mean across all experiments
+m <- FindConservedMarkers(bc,ident.1 = "M", ident.2= c("E","diff_inactive"),grouping.var = 'orig.ident',test.use = "wilcox",logfc.threshold = 0.0001,meta.method = metap::sumlog)
+
+
+m$avg_log2FC <-  rowMeans(m[,grepl('log2FC',colnames(m))])
+
+m.filtered <- m[m$minimump_p_val<= 0.05  & 
+                  rowMeans(m[,grepl('log2FC',colnames(m))]) > 0.1 ,]
+
+m.filtered.neg <- m[m$minimump_p_val<= 0.05  & 
+                  rowMeans(m[,grepl('log2FC',colnames(m))]) < -0.1 ,]
+
+m.all <- m[m$minimump_p_val<= 0.05  & 
+                  abs(rowMeans(m[,grepl('log2FC',colnames(m))])) > 0.1 ,]
+
+
+m.filtered <- m.filtered[order(m.filtered$avg_log2FC,decreasing = TRUE),]
+m.filtered.neg <- m.filtered.neg[order(m.filtered.neg$avg_log2FC),]
+m.fate <- rownames(m.filtered)
+m.fate.neg <- rownames(m.filtered.neg)
+
+
+```
+
+
+now lets plot the results using a Volcano Plot
+
+```{r volcanoPlot, message = FALSE, warning = FALSE} 
+
+
+genes.to.highlight <- c("Cd48","Sell","Mpo","Ms4a3","Ctsg","Cpa3","Cd79b",
+               "Cepbe",'Clec21a',"Gng11","Mecom","Hlf","Nupr1","S100a6","Nrgn","Orai2","Cst7","Plac8","Vamp5","Rbm39")
+volcanoPlotHSPC(m,genes.to.highlight)
+
+
+genes.to.highlight.metabolic <- c("Hk1","Slc20a2","Ldhb","Slc16a1","Ndufs3", "Idh2","Gapdh","Taldo1","Tkt","Slc2a3","Kyat3","Gng11")
+
+volcanoPlotHSPC2(m,genes.to.highlight.metabolic)
+
+
+
+
+```
+
+# Step 6: Differential Pathway Analysis
+
+Lets group DEGs by pathway annotations using the enrichR package. 
+
+
+```{r Pathways, message = FALSE, warning = FALSE} 
+
+
+
+DEenrichRPlot(
+  bc,
+  ident.1 = "M",
+  ident.2 = c("E","diff_inactive"),
+  balanced = TRUE,
+  logfc.threshold = 0.1,
+  assay = NULL,
+  max.genes = 2000,
+  test.use = "wilcox",
+  p.val.cutoff = 0.05,
+  cols = NULL,
+  enrich.database = c("GO_Biological_Process_2021"),
+  num.pathway = 30,
+  return.gene.list = FALSE
+)
+
+
+
+DEenrichRPlot(
+  bc,
+  ident.1 = "M",
+  ident.2 = c("E","diff_inactive"),
+  balanced = TRUE,
+  logfc.threshold = 0.1,
+  assay = NULL,
+  max.genes = 3000,
+  test.use = "wilcox",
+  p.val.cutoff = 0.05,
+  cols = NULL,
+  enrich.database = c("KEGG_2019_Mouse"),
+  num.pathway = 30,
+  return.gene.list = FALSE
+)
+
+
+kegg <- DEenrichRPlot(
+  bc,
+  ident.1 = "M",
+  ident.2 = c("E","diff_inactive"),
+  balanced = FALSE,
+  logfc.threshold = 0.1,
+  assay = NULL,
+  max.genes = 1000,
+  test.use = "wilcox",
+  p.val.cutoff = 0.05,
+  cols = NULL,
+  enrich.database = c("KEGG_2019_Mouse"),
+  num.pathway = 25,
+  return.gene.list = TRUE
+)
+
+
+write.csv(kegg,"EnrichR_pathways.csv")
+
+  #depending on which version of the kegg database we use we might get slightly different genes, 
+  #here we take metabolically associated genes from our pathway analysis just to be sure that they
+  #are included in the final definition of metabolic genes
+metabolic.signatures <- updateMetabolicSignature(metabolic.signatures)
+
+
+
+```
+
+
+# Step 7. Categorise genes into metabolic and transcription factor associated groups
+
+get the differentially expressed genes that relate to metabolism or transcription factor activity and make them into a signature
+
+```{r DEGs_metabolic, message = FALSE, warning = FALSE} 
+
+#make a gene set that relates to metabolism
+
+m.metab <- intersect(metabolic.signatures$allGenesTested,m.fate)
+
+m.tf <- intersect(TF.genes,m.fate)
+
+
+#now lets save our signatures to a separate file so that we can use them later on. 
+metabolic.signatures$metafate_m <- m.metab
+metabolic.signatures$fate_m <- m.fate
+metabolic.signatures$tf_m <- m.tf
+
+save(metabolic.signatures,file = '/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/JCB4_metabolism_bioinformatics_pipeline/genesets/geneset_Robjects/metabolic_signatures_metafate.Rda')
+
+```
+
+Lets see if the MetaFate signature is different to the DRAG fate signature. 
+```{r DEGs_metabolic2, message = FALSE, warning = FALSE} 
+
+dataset.integrated <- AddModuleScore(dataset.integrated , features = list(m.metab),
+                           name = "m_metab",replace = TRUE,assay = "RNA")
+
+
+dataset.integrated <- AddModuleScore(dataset.integrated , features = list(m.fate),
+                           name = "m_fate",replace = TRUE,assay = "RNA")
+
+
+FeaturePlot(dataset.integrated,c("m_fate1","m_metab1"), cols = c("grey80",rgb(67/255,138/255,201/255,1)),
+            min.cutoff = "q5", max.cutoff = "q95",reduction = "umap",pt.size = 1.2) 
+
+
+FeaturePlot(bc,c("bias.score"), 
+            min.cutoff = "q1", max.cutoff = "q99",
+            reduction = "umap",pt.size = 1.2) 
+
+
+```
+
+
+# Step 8. 4-fold Cross Validation of our Signature Generation Approach
+
+```{r permutation_test2, message = FALSE, warning = FALSE} 
+
+nfold <- 4
+
+mat <- K_fold_cross_validation(nfold,12345,bc)
+boxplot(mat)
+
+
+```
+
+
+# Step 9. Permutation testing to assess significance of our signatures
+
+To assess how informative our signatures are we use a permutation test based approach in which we calculate the Spearmans correlation between signature scores and myeloid bias for each cell. To determine what correlation scores would occur just due to change we also generate correlation scores for randomly sampled (200 replicates) gene sets of an equivalent size. 
+
+
+```{r permutation_test3, message = FALSE, warning = FALSE} 
+
+
+
+
+
+bc<- AddModuleScore(bc, features = list(m.fate),
+                           name = "M_fate",replace = TRUE,assay = "RNA")
+
+bc<- AddModuleScore(bc, features = list(m.tf),
+                           name = "M_tf",replace = TRUE,assay = "RNA")
+
+bc<- AddModuleScore(bc , features = list(m.metab),
+                           name = "m_metab",replace = TRUE,assay = "RNA")
+
+sobj <- bc 
+
+
+m.perm <- permutationTest(m.fate,sobj,"bias.score",200)
+m.metab.perm <- permutationTest(m.metab,sobj,"bias.score",200)
+m.tf.perm <- permutationTest(m.tf,sobj,"bias.score",200)
+mpp3.perm<- permutationTest(intersect(rownames(sobj),
+                                      gene.sets$Pia_MPP3),
+                                    sobj,"bias.score",200)
+
+
+plotPermutationResults(200,cor.test( bc$M_fate1,
+          bc$bias.score, method = "spearman")$estimate[[1]],
+          
+          cor.test( bc$m_metab1,
+          sobj$bias.score, method = "spearman")$estimate[[1]],
+          
+          cor.test( bc$Pia_MPP31,
+          bc$bias.score, method = "spearman")$estimate[[1]],
+
+          cor.test( bc$M_tf1,
+          bc$bias.score, method = "spearman")$estimate[[1]])
+
+
+
+
+```
+
+
+

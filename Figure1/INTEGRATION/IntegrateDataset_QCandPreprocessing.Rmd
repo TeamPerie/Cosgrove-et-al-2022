@@ -1,0 +1,253 @@
+---
+title: "MetaFate: Data QC, Preprocessing and Integration"
+output: html_document
+author: Jason Cosgrove (jason.cosgrove@curie.fr) 
+---
+
+<style type="text/css">
+
+body{ /* Normal  */
+      font-size: 12px;
+  }
+td {  /* Table  */
+  font-size: 8px;
+}
+h1.title {
+  font-size: 38px;
+  color: DarkRed;
+}
+h1 { /* Header 1 */
+  font-size: 28px;
+  color: DarkBlue;
+}
+h2 { /* Header 2 */
+    font-size: 22px;
+  color: DarkBlue;
+}
+h3 { /* Header 3 */
+  font-size: 18px;
+  font-family: "Times New Roman", Times, serif;
+  color: DarkBlue;
+}
+code.r{ /* Code block */
+    font-size: 12px;
+}
+pre { /* Code block - determines code spacing between lines */
+    font-size: 14px;
+}
+</style>
+
+
+
+
+
+In this study we combine lineage tracing and RNA sequencing to understand the metabolic regulators of hematopoietic stem and progenitor cell differentiation in vivo (MetaFate). 
+
+
+To perofrm metafate, we use the DRAG (Diversity through RAG) barcoding technology that allows endogenous barcoding of cellular lineages in situ in a temporally controlled manner. Specifically, CagCre+/- DRAG+/- mice are given a tamoxifen injection to induce barcode recombination.  Once cells are induced, all offspring of barcoded cells inherit the genetic-label and a GFP tag. As barcode transcripts have a poly(A) tail, they are directly detectable using standard single cell transcriptomics approaches. For each cell we can therefore obtain 3 pieces of information: (i) gene expression data (ii) a cellular barcode (iii) barcode abundance in the myeloid and erythroid lineages. 
+
+Specifically, barcoded LSKs (Sca1+ cKit+ GFP+), Cd11b+ GFP+ Myeloid and Ter119+ CD44+ GFP+ nucleated erythroid cells were isolated from the bone marrow of N mice using fluorescence activated cell sorting (FACS) 50-78 weeks after tamoxifen injection. HSPCs were then processed for single cell RNA sequencing and targeted barcode amplification using a customised version of 10X genomic protocol. In erythroid and myeloid cells, barcodes were detected from bulk cell populations at the DNA level with cells undergoing lysis and a nested PCR reaction. 
+
+In this script we combine information from the transcriptome together with lineage barcodes detected in HSPCs and in peripheral hematopoietic cells.
+
+
+
+
+# Step 1: Prepare the workspace, loading the appropriate packages and reading the data in with associated metadata
+ 
+```{r initialiseWorkspace, message = FALSE, warning = FALSE}  
+#clear the workspace
+rm(list=ls())
+#set the working directory and load in required libraries
+setwd("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/MetaFate_final_pipeline/pipeline_scripts/INTEGRATION/")
+library(Seurat)
+library(scran)
+library(org.Mm.eg.db)
+library(clustree)
+library(dplyr)
+library(enrichR)
+library(ggrepel)
+library(Rmagic)
+library(ggpubr)
+library(gplots)
+source("helper_methods_refactored.R")
+set.seed(12345)
+
+
+``` 
+
+
+# Step 2. generate the lineage barcode dataframe, which will be added to the metadata slot of the seurat objects
+
+```{r generate_barcode_metadata, message = FALSE, warning = FALSE}
+
+setwd("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/MetaFate_final_pipeline/data/Step6_10X_Data_integration")
+
+
+#update with the barcode metadata
+bc.metadata <- read.csv("DNA_RNA_BC_PAIRS/all_dna_rna_bc_pairs.csv")
+
+#make sure expt info is added to each barcode so that repeat use barcodes are not grouped across mice
+bc.metadata$Con.seq_perexpt <- paste(bc.metadata$Con.seq,"_",bc.metadata$expt,sep = "")
+
+#add the pgen probabilities to the metadata matrix
+bc.metadata <- updatePGEN(bc.metadata)
+
+#print key statistics about barcodes in the dataset
+printBarcodeSummaryStatistics(bc.metadata)
+``` 
+
+#Step2b visualise the DNA lineage barcode data to understand the major trends in the data
+
+```{r DNAlineagebarcode, message = FALSE, warning = FALSE}
+df <- read.csv("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/MetaFate_final_pipeline/data/Step6_10X_Data_integration/DNA_barcodes/cellnorm_barcodes_filtered.csv",row.names = 1)
+
+M <- rowSums(df[,c(1,3,5,7,9)])
+E <- rowSums(df[,c(2,4,6,8,10)])
+d <- rbind(M,E)
+
+df2 <- read.csv("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/MetaFate_final_pipeline/data/Step6_10X_Data_integration/DNA_RNA_BC_PAIRS/all_dna_rna_bc_pairs.csv")
+
+df2.subset <- df2[,c(10,12)]
+
+df2.subset <- df2.subset[complete.cases(df2.subset$Myeloid)
+                         & complete.cases(df2.subset$Erythroid),]
+
+d.transpose <- t(d)
+
+
+in.hspc <- rownames(d.transpose) %in% unique(df2$Con.seq)
+in.hspc.col <- ifelse(in.hspc == 0,"black","red")
+
+
+
+heatmap.2(asinh(as.matrix(d)) ,col=colorRampPalette(c("black","green","red"),bias = 2)(300),scale = "none",trace = "none", density.info = "none",distfun = function(x) dist(x,method = 'euclidean'),colCol = in.hspc.col,cexCol = 0.2,dendrogram='none', Rowv=TRUE, Colv=TRUE,ColSideColors = in.hspc.col)
+
+
+
+boxplot(t(d),outline = F)
+
+
+
+
+``` 
+
+
+# Step 3. load in the 10X expression matrices, preprocessed by the CellRanger pipeline, and convert them into seurat objects. 
+
+```{r load_data, message = FALSE, warning = FALSE}  
+
+root_path <- "/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Dry_Lab/MetaFate_final_pipeline/data/Step5_10X_cell_ranger_QC/"
+
+m1 <- Read10X(data.dir= paste(root_path,"exp4_ET27a/cell_ranger_matrix/",sep = "")) 
+m2 <- Read10X(data.dir= paste(root_path,"exp5_ET27b/cell_ranger_matrix/",sep = "")) 
+m3 <- Read10X(data.dir= paste(root_path,"exp6_JCW26/cell_ranger_matrix/M2/",sep = "")) 
+m4 <- Read10X(data.dir= paste(root_path,"exp6_JCW26/cell_ranger_matrix/M3/",sep = "")) 
+m5 <- Read10X(data.dir= paste(root_path,"exp6_JCW26/cell_ranger_matrix/M4/",sep = "")) 
+
+#create a list of seurat objects, one for each experiment
+dataset.list <- CreateSeuratObjects(m1,m2,m3,m4,m5,bc.metadata)
+
+```
+
+
+# Step 4. Perform data QC preprocessing
+
+To assess the quality of the data we assess the library sizes, numbers of genes expressed and mitochondrial content per cell. Cells which have very high library sizes or relative to other cells in the data may represent doublet cells and so are filtered out. Cells with very low library sizes are typically because of poor capture quality pontentially due to cell death, premature rupture, or capture of random mRNA escaping from cells, consequently cells with low library sizes are also filtered out from downstream analyses. 
+
+Another important QC metric is mitochondrial content. As discussed in AlJanahi et al (2018) "High numbers of mitochondrial transcripts are indicators of cell stress, and therefore cells with elevated mitochondrial gene expression are often not included in the analysis, because most experiments will not benefit from clustering cells based on stress levels. However, just as with number of transcripts, this parameter is highly dependent on the tissue type and the questions being investigated. For example, 30% of total mRNA in the heart is mitochondrial due to high energy needs of cardiomyocytes, compared with 5% or less in tissues with low energy demands. For instance, 30% mitochondrial mRNA is representative of a healthy heart muscle cell, but would represent a stressed lymphocyte." Here as we are studying metabolism we need to be very careful about using this filter. 
+
+```{r filterData, message = FALSE, warning = FALSE}  
+
+#add the percentage of reads that map to mitochondrial reads, this will be used as a QC metric in the next section
+dataset.list <- update_QC_metadata(dataset.list)
+
+######## mouse 1
+VlnPlot(dataset.list[[1]], features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+dataset.list[[1]] <- subset(x = dataset.list[[1]], subset = nCount_RNA > 500 & nCount_RNA < 50000 & nFeature_RNA > 500
+               & nFeature_RNA < 7000 & percent.mt < 10 & percent.mt > 1)
+
+######## mouse 2
+
+VlnPlot(dataset.list[[2]], features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+dataset.list[[2]] <- subset(x =dataset.list[[2]], subset = nCount_RNA > 1000 & nCount_RNA < 90000 & nFeature_RNA > 500
+               & nFeature_RNA < 7500 & percent.mt < 10 & percent.mt > 2)
+
+######## mouse 3
+VlnPlot(dataset.list[[3]], features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+dataset.list[[3]] <- subset(x =dataset.list[[3]], subset = nCount_RNA > 500 & nCount_RNA < 40000 & nFeature_RNA > 500
+               & nFeature_RNA < 6000 & percent.mt < 10 & percent.mt > 1)
+
+######## mouse 4
+VlnPlot(dataset.list[[4]], features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+dataset.list[[4]] <- subset(x =dataset.list[[4]], subset = nCount_RNA > 500 & nCount_RNA < 50000 & nFeature_RNA > 500
+               & nFeature_RNA < 6000 & percent.mt < 10 & percent.mt > 2)
+
+######## mouse 5
+VlnPlot(dataset.list[[5]], features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+dataset.list[[5]] <- subset(x =dataset.list[[5]], subset = nCount_RNA > 500 & nCount_RNA < 50000 & nFeature_RNA > 300
+               & nFeature_RNA < 6000 & percent.mt < 10 & percent.mt > 2)
+
+#for this specific analysis we dont care about unannotated genes, or ribosomal genes so let's filter them out
+for (i in 1:length(dataset.list)) {
+  sobj <- dataset.list[[i]]
+  dataset.list[[i]] <- removeUninformativeGenes(sobj)
+}
+
+
+```
+
+
+
+# Step 5. Find variably expressed genes and normalise the data
+
+When analyzing sequencing data, normalization to eliminate batch effects is crucial if multiple sequencing runs are to be compared with each other. These batch effects can be caused by often unavoidable technical variations such as the duration samples were kept on ice, number of freeze-thaw cycles, method of RNA isolation, sequencing depth, etc.
+
+An additional consideration is that droplet-based sequencing in addition consists of thousands of individual cell experiments, hence cell-specific biases must also be considered when normalizing, in order to be able to compare the expression of one cell to another.  A notable cell-specific bias is caused by mRNA capture efficiency, where the mRNA molecules are not captured by the bead at the same proportion in all droplets. As individual cells are not all of the same type a key consideration is how to retain cell to cell variability while eliminating technical noise. To normalise our data we use  the default seurat method. For the default method feature counts for each cell are divided by the total counts for that cell and multiplied by the scale.factor. This is then natural-log transformed using log1p. 
+
+To find variably expressed genes of interest to take forward for further analysis we use Seurats vst method. Briefly, this approach models the relationship between log mean expression and log variance using local polynomial regression. The features values are then standardized using the observed mean and predicted variance, with the final variance value calculated on the standardized values. 
+```{r normalise_data, message = FALSE, warning = FALSE}  
+
+for (i in 1:length(dataset.list)) {
+    dataset.list[[i]] <- NormalizeData(dataset.list[[i]], verbose = FALSE)
+    dataset.list[[i]] <- FindVariableFeatures(dataset.list[[i]], selection.method = "vst", nfeatures = 4000, verbose = FALSE)
+}
+
+```
+
+
+# Step 6. Integrate the datasets
+
+Seurat v4 includes a set of methods to match (or ‘align’) shared cell populations across datasets. These methods first identify cross-dataset pairs of cells that are in a matched biological state (‘anchors’), can be used both to correct for technical differences between datasets (i.e. batch effect correction), and to perform comparative scRNA-seq analysis of across experimental conditions.
+
+```{r integrate_data, message = FALSE, warning = FALSE}  
+
+features <- SelectIntegrationFeatures(object.list = dataset.list,
+                                      nfeatures = 4000)
+dataset.anchors <- FindIntegrationAnchors(object.list = dataset.list,anchor.features = features, dims = 1:15)
+dataset.integrated <- IntegrateData(anchorset = dataset.anchors, dims = 1:15)
+DefaultAssay(dataset.integrated) <- "integrated"
+
+VlnPlot(dataset.integrated, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+```
+
+
+# Step 7. Perform CellCycle Annotation
+
+To assign a cell cycle phase to each cell, we use the cyclone method in the R package scran. In this scheme, a supervised learning approach was used to identify pairs of markers for each cell cycle phase. A G1 marker pair would comprise a gene with high expression in G1 relative to other phases, while the second gene would be lower in G1 relative to all other phases. To classify cell cycle phase on a new dataset, cyclone calculates the proportion of all marker pairs for which the expression of the first gene is higher than the second gene. A high proportion then suggests that the cell belongs to a given cell cycle phase. 
+
+```{r annotateCellCycle, message = FALSE, warning = FALSE}  
+
+dataset.integrated <- cellCycleAnalysis(dataset.integrated)
+table(dataset.integrated@meta.data$phases)
+saveRDS(dataset.integrated,file = "sobj_integrated.Rda")
+
+```
+
+
