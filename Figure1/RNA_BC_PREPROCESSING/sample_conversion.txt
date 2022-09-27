@@ -1,0 +1,10 @@
+10x_step3-5_534-v2	m534
+10x_step3-5_M3	M3
+10x_step3-5_454	m454
+10x_step3-5_M2	M2
+10x_step3-5_ET27b	ET27_Dec2020_LSKs
+10x_step3-5_M1-v2	M1
+10x_step3-5_M4	M4
+10x_step3-5_LP11	GFP_plus
+10x_step3-5_100	ET27_LSKs2
+10x_step3-5_30	ET27_LSKs1
