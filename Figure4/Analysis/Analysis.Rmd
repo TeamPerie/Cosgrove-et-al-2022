@@ -1,0 +1,913 @@
+---
+title: "lenti_analysis"
+author: "Jason Cosgrove"
+date: "19/10/2021"
+output: html_document
+---
+
+# Analysis of clone size, diversity in fate of barcoded progenitors from WT and G6PD-Tg mice
+
+In this experiment we sorted MPPs from G6PD-Tg mice and from WT littermate controls (send from IMDEA madrid) and barcoded them with the LG2.2 library. Cells were transplanted into irradiated recipients and 3 weeks later the bone marrow was harvested, barcoded cells were sorted and lysed for barcode library sequencing. 
+
+
+### Step 1: Set up the workspace
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Wet_lab/JCW24_G6PD_barcoding/LentiviralBarcoding_Analysis/inputs/")
+
+#clear the workspace and load in the necessary packages
+rm(list = ls())
+library(cowplot)
+library(plotrix)
+library(ggplot2)
+library(dplyr)
+
+source('/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Wet_lab/JCW24_G6PD_barcoding/LentiviralBarcoding_Analysis/helper_methods_mature.R')
+
+setwd("/Users/jasoncosgrove/Dropbox (Team_Perie)/Jason/Experiments/Wet_lab/JCW24_G6PD_barcoding/LentiviralBarcoding_Analysis/inputs/")
+# Set output directory
+output_fp <- "/Users/jasoncosgrove/Desktop/"
+
+
+```
+
+
+
+
+
+### Step 2: Load the data
+
+The data has been demultiplexed, QCd and filtered using xcalibr, and R scripts. Full pipeline available in the LentiviralBarcoding_Demultiplexing and LentiviralBarcoding_QC folders
+```{r readData, include=TRUE}
+#read in the QC'd and filtered data
+wt.mat <- read.csv("JCW24WT_ANALYSIS_matx_norm_filt_cor_ab_trueFalseRU.csv")
+tg.mat <- read.csv("JCW24TG_ANALYSIS_matx_norm_filt_cor_ab_trueFalseRU.csv")
+
+```
+
+
+
+### Step 3: Sample-level normalisation
+
+Population sizes vary dramatically between different cell types in the hematopoietic system and so a normalisation should be made to the data prior to making biological inferences. We perform a column-wise normalisation such that each column sums to 1. The value in each i,j position then represents the proportional abundance of barcode i in sample j. 
+```{r normaliseBySample, include=TRUE}
+
+# normalise the count matrices
+wt.barcodes <- wt.mat$tag
+tg.barcodes <- tg.mat$tag
+wt.mat.norm <- columnNormalisation(wt.mat[,-1],wt.barcodes)
+tg.mat.norm <- columnNormalisation(tg.mat[,-1],tg.barcodes)
+
+#remove clones that dont appear in any sample and remove the mpps from the analysis
+wt.mat.norm.filt <- removeUninformativeClones(wt.mat.norm[,!grepl("CKIT",colnames(wt.mat.norm))])
+tg.mat.norm.filt <- removeUninformativeClones(tg.mat.norm[,!grepl("CKIT",colnames(tg.mat.norm))])
+
+
+write.csv(wt.mat.norm.filt,"/Users/jasoncosgrove/Desktop/Fig3WT.csv")
+write.csv(tg.mat.norm.filt,"/Users/jasoncosgrove/Desktop/Fig3Tg.csv")
+
+```
+
+
+
+### Step 4: Make a count matrix for each mouse
+
+Split the matrix so that we can analyse each mouse independently
+```{r getMouseMatrices, include=TRUE}
+
+wt.m1<- getMouseMatrix(wt.mat.norm.filt,"M1.WT")
+wt.m2<- getMouseMatrix(wt.mat.norm.filt,"M2.WT")
+wt.m3<- getMouseMatrix(wt.mat.norm.filt,"M3.WT")
+wt.m4<- getMouseMatrix(wt.mat.norm.filt,"M4.WT")
+tg.m1<- getMouseMatrix(tg.mat.norm.filt,"M1.TG")
+tg.m2<- getMouseMatrix(tg.mat.norm.filt,"M2.TG")
+tg.m3<- getMouseMatrix(tg.mat.norm.filt,"M3.TG")
+tg.m4<- getMouseMatrix(tg.mat.norm.filt,"M4.TG")
+
+
+
+#get the number of clones for each mouse
+nrow(wt.m1)
+nrow(wt.m2)
+nrow(wt.m3)
+nrow(wt.m4)
+nrow(tg.m1)
+nrow(tg.m2)
+nrow(tg.m3)
+nrow(tg.m4)
+
+```
+
+
+### Step 5: cell count normalisation
+
+The count matrix actually represents the number of sequencing reads measured for each barcode. But it is not the case that 1 read equals 1 cell because it depends on how many cells you had in the beginning, how much of your sample was sorted, and what is your sequencing depth. We record how many cells we sort and how much volume of our total sample we sort so we can use this information to convert reads to cell numbers. 
+```{r cellCount normalisation, include=TRUE}
+
+# now normalise the read counts by cell counts
+m1.wt.cellnorm <- cellcountNormalisation("M1-WT", wt.m1)
+m2.wt.cellnorm <- cellcountNormalisation("M2-WT", wt.m2)
+m3.wt.cellnorm <- cellcountNormalisation("M3-WT", wt.m3)
+m4.wt.cellnorm <- cellcountNormalisation("M4-WT", wt.m4)
+m1.tg.cellnorm <- cellcountNormalisation("M1-Tg", tg.m1)
+m2.tg.cellnorm <- cellcountNormalisation("M2-Tg", tg.m2)
+m3.tg.cellnorm <- cellcountNormalisation("M3-Tg", tg.m3)
+m4.tg.cellnorm <- cellcountNormalisation("M4-Tg", tg.m4)
+
+```
+
+
+
+
+### Step 6: for each sample make a meta-mouse merging individual mice into one representative sample for each experimental condition
+
+Here we combine mice by each sample to create a metasample for each condition. This allows us to look globally at what the difference between the two conditions is
+```{r makeMetaMouse, include=TRUE}
+
+# merge the different mice into a single sample
+wt.meta <- makeMetaMouse(wt.m1, wt.m2, wt.m3, wt.m4)
+tg.meta <- makeMetaMouse(tg.m1, tg.m2, tg.m3, tg.m4)
+
+# merge the different mice into a single sample
+wt.meta.cellnorm <- makeMetaMouse(m1.wt.cellnorm,
+                                  m2.wt.cellnorm,
+                                  m3.wt.cellnorm,
+                                  m4.wt.cellnorm)
+
+tg.meta.cellnorm <- makeMetaMouse(m1.tg.cellnorm,
+                                  m2.tg.cellnorm,
+                                  m3.tg.cellnorm,
+                                  m4.tg.cellnorm)
+
+```
+
+
+
+### Step 7: Clone size distributions per sample
+
+When analysing lineage tracing data one key metric is the clone size distributions. Here we analyse clone size distributions for the M, E and B lineages in the WT and Tg mice. We observe significant differences in clone size distributions for E and B when we group all mice together
+```{r clone_sizes_mature, include=TRUE}
+
+boxplot(wt.meta$M,wt.meta$E, wt.meta$B,
+        tg.meta$M,tg.meta$E, tg.meta$B , 
+        outline = F,las = 2,ylab = "relative barcode abundance per lineage", main = "Clone Size Distributions Per Condition per Lineage",
+        at =c(1,2,3, 5,6,7),col = c("red","red","red","blue","blue","blue"),
+        names = c("WT - M", "WT - E","WT - B",
+                  "Tg - M", "Tg - E","Tg - B"))
+
+
+wilcox.test(wt.meta$M,tg.meta$M)
+wilcox.test(wt.meta$B,tg.meta$B)
+wilcox.test(wt.meta$E,tg.meta$E)
+
+#clone size distributions normalised by cell count
+boxplot(wt.meta.cellnorm$M,wt.meta.cellnorm$E, wt.meta.cellnorm$B,
+        tg.meta.cellnorm$M,tg.meta.cellnorm$E, tg.meta.cellnorm$B , 
+        outline = F,
+        las = 2,ylab = "cells per barcode per lineage", main = "Clone Size Distributions in Cell Counts per Condition per Lineage",
+        at =c(1,2,3, 5,6,7),col = c("red","red","red","blue","blue","blue"),
+        names = c("WT - M", "WT - E","WT - B",
+                  "Tg - M", "Tg - E","Tg - B"))
+
+
+wilcox.test(wt.meta.cellnorm$M,tg.meta.cellnorm$M)
+wilcox.test(wt.meta.cellnorm$B,tg.meta.cellnorm$B)
+wilcox.test(wt.meta.cellnorm$E,tg.meta.cellnorm$E)
+
+```
+
+
+
+### Step 8: Clone size distributions per mouse
+
+Here we plot clone size distributions for each lineage for each mouse
+```{r clone_sizes_mice, include=TRUE}
+
+boxplot(wt.m1$M,wt.m1$E, wt.m1$B,
+        wt.m2$M,wt.m2$E, wt.m2$B,
+        wt.m3$M,wt.m3$E, wt.m3$B,
+        wt.m4$M,wt.m4$E, wt.m4$B,
+        tg.m1$M,tg.m1$E, tg.m1$B , 
+        tg.m2$M,tg.m2$E, tg.m2$B , 
+        tg.m3$M,tg.m3$E, tg.m3$B , 
+        tg.m4$M,tg.m4$E, tg.m4$B , 
+        outline = F,las = 2,ylab = "relative barcode abundance", 
+        main = "Clone Size Distributions Per Condition per Mouse",
+        col = c(rep("red",12),rep("blue",12)),
+        names = c("WT1 - M", "WT1 - E","WT1 - B",
+                  "WT2 - M", "WT2 - E","WT2 - B",
+                  "WT3 - M", "WT3 - E","WT3 - B",
+                  "WT4 - M", "WT4 - E","WT4 - B",
+                  "Tg1 - M", "Tg1 - E","Tg1 - B",
+                  "Tg2 - M", "Tg2 - E","Tg2 - B",
+                  "Tg3 - M", "Tg3 - E","Tg3 - B",
+                  "Tg4 - M", "Tg4 - E","Tg4 - B"))
+
+
+
+#Plot the median Myeloid clone size for each mouse, comparing WT and Tg
+plotCloneSizes(wt.m1,wt.m2,wt.m3,wt.m4,
+               tg.m1,tg.m2,tg.m3,tg.m4,"M")
+
+plotCloneSizes(wt.m1,wt.m2,wt.m3,wt.m4,
+               tg.m1,tg.m2,tg.m3,tg.m4,"B")
+
+plotCloneSizes(wt.m1,wt.m2,wt.m3,wt.m4,
+               tg.m1,tg.m2,tg.m3,tg.m4,"E")
+
+
+
+boxplot(m1.wt.cellnorm$M,m1.wt.cellnorm$E, m1.wt.cellnorm$B,
+        m2.wt.cellnorm$M,m2.wt.cellnorm$E, m2.wt.cellnorm$B,
+        m3.wt.cellnorm$M,m3.wt.cellnorm$E, m3.wt.cellnorm$B,
+        m4.wt.cellnorm$M,m4.wt.cellnorm$E, m4.wt.cellnorm$B,
+        m1.tg.cellnorm$M,m1.tg.cellnorm$E, m1.tg.cellnorm$B , 
+        m2.tg.cellnorm$M,m2.tg.cellnorm$E, m2.tg.cellnorm$B , 
+        m3.tg.cellnorm$M,m3.tg.cellnorm$E, m3.tg.cellnorm$B , 
+        m4.tg.cellnorm$M,m4.tg.cellnorm$E, m4.tg.cellnorm$B , 
+        outline = F,las = 2,ylab = "relative barcode abundance", 
+        main = "Clone Size Distributions Per Condition per Mouse",
+        col = c(rep("red",12),rep("blue",12)),
+        names = c("WT1 - M", "WT1 - E","WT1 - B",
+                  "WT2 - M", "WT2 - E","WT2 - B",
+                  "WT3 - M", "WT3 - E","WT3 - B",
+                  "WT4 - M", "WT4 - E","WT4 - B",
+                  "Tg1 - M", "Tg1 - E","Tg1 - B",
+                  "Tg2 - M", "Tg2 - E","Tg2 - B",
+                  "Tg3 - M", "Tg3 - E","Tg3 - B",
+                  "Tg4 - M", "Tg4 - E","Tg4 - B"))
+
+
+
+plotCloneSizes(m1.wt.cellnorm,m2.wt.cellnorm,m3.wt.cellnorm,m4.wt.cellnorm,
+               m1.tg.cellnorm,m2.tg.cellnorm,m3.tg.cellnorm,m4.tg.cellnorm,"M")
+
+plotCloneSizes(m1.wt.cellnorm,m2.wt.cellnorm,m3.wt.cellnorm,m4.wt.cellnorm,
+               m1.tg.cellnorm,m2.tg.cellnorm,m3.tg.cellnorm,m4.tg.cellnorm,"B")
+
+plotCloneSizes(m1.wt.cellnorm,m2.wt.cellnorm,m3.wt.cellnorm,m4.wt.cellnorm,
+               m1.tg.cellnorm,m2.tg.cellnorm,m3.tg.cellnorm,m4.tg.cellnorm,"E")
+
+```
+
+### Step 9: Clone diversity in the meta mouse
+
+Aside from clone size distributions we can also look at how many clones there are in each celltype. This gives an indication of how many MPPs contribute to each cell lineage
+```{r diversity, include=TRUE}
+
+barplot(c(wt.meta %>% filter(M > 0) %>% nrow(),
+        tg.meta %>% filter(M > 0) %>% nrow(),
+        wt.meta %>% filter(E > 0) %>% nrow(),
+        tg.meta %>% filter(E > 0) %>% nrow(),
+        wt.meta %>% filter(B > 0) %>% nrow(),
+        tg.meta %>% filter(B > 0) %>% nrow()),
+        names = c("WT-M","Tg-M", 
+                  "WT-E","Tg-E",
+                  "WT-B","Tg-B"),
+        col = c("red","blue","red","blue","red","blue"), 
+        main = "clonal diversity")
+
+
+```
+
+### Step 10: Clone diversity between mice
+
+Here we how the same as above but show mouse to mouse variability. We observe no significant differences between WT and Tg in this setting
+```{r diversityPerMouse, include=TRUE}
+
+#compute the total clonal diversity in each setting
+wt.m <- c(table(wt.m1$M > 0)[[2]],
+          table(wt.m2$M > 0)[[2]],
+          table(wt.m3$M > 0)[[2]],
+          table(wt.m4$M > 0)[[2]])
+
+tg.m <- c(table(tg.m1$M > 0)[[2]],
+          table(tg.m2$M > 0)[[2]],
+          table(tg.m3$M > 0)[[2]],
+          table(tg.m4$M > 0)[[2]])
+
+boxplot(wt.m,tg.m, main = "Comparison of clone size distributions between WT and Tg in Myeloid",
+        ylab = "total number of clones per mouse",names = c("WT","Tg"), col = c("blue","red"))
+
+
+
+wt.e <- c(table(wt.m1$E > 0)[[2]],
+          table(wt.m2$E > 0)[[2]],
+          table(wt.m3$E > 0)[[2]],
+          table(wt.m4$E > 0)[[2]])
+
+tg.e <- c(table(tg.m1$E > 0)[[2]],
+          table(tg.m2$E > 0)[[2]],
+          table(tg.m3$E > 0)[[2]],
+          table(tg.m4$E > 0)[[2]])
+
+boxplot(wt.e,tg.e, main = "Comparison of clone size distributions between WT and Tg in Erythroid",
+        ylab = "total number of clones per mouse",names = c("WT","Tg"), col = c("blue","red"))
+
+
+wt.b <- c(table(wt.m1$B > 0)[[2]],
+          table(wt.m2$B > 0)[[2]],
+          table(wt.m3$B > 0)[[2]],
+          table(wt.m4$B > 0)[[2]])
+
+tg.b <- c(table(tg.m1$B > 0)[[2]],
+          table(tg.m2$B > 0)[[2]],
+          table(tg.m3$B > 0)[[2]],
+          table(tg.m4$B > 0)[[2]])
+
+boxplot(wt.b,tg.b, main = "Comparison of clone size distributions between WT and Tg in B",
+        ylab = "total number of clones per mouse",names = c("WT","Tg"), col = c("blue","red"))
+
+
+
+```
+
+
+
+### Step 11: M vs E bias in the meta mouse
+
+Now we have analysed differences in clone size distributions and clonal diversity we can look at barcode sharing across lineages. First we will compare 2 lineages at a time using a simple scatter plot
+```{r FateBiasBinaryClassifierME, include = TRUE}
+
+qplot(log(wt.meta.cellnorm$M+ 1) ,log(wt.meta.cellnorm$E + 1),main = "WT M vs E with cell normalisation", xlim = c(0,11),ylim = c(0,11)) + geom_abline(intercept = 0,slope = 1, col = 'grey30') +  geom_point(size=1)
+
+qplot(log(tg.meta.cellnorm$M+ 1) ,log(tg.meta.cellnorm$E + 1),main = "Tg M vs E with cell normalisation" , xlim = c(0,11),ylim = c(0,11)) + geom_abline(intercept = 0,slope = 1, col = 'grey30') +  geom_point(size=1)
+
+
+```
+
+
+### Step 11: M vs B bias in the meta mouse
+```{r FateBiasBinaryClassifierMB, include = TRUE}
+
+qplot(log(wt.meta.cellnorm$M+ 1) ,log(wt.meta.cellnorm$B + 1),main = "WT M vs B with cell normalisation", xlim = c(0,12),ylim = c(0,12)) + geom_abline(intercept = 0,slope = 1, col = 'grey30') +  geom_point(size=1)
+
+qplot(log(tg.meta.cellnorm$M+ 1) ,log(tg.meta.cellnorm$B + 1),main = "Tg M vs B with cell normalisation" , xlim = c(0,12),ylim = c(0,12)) + geom_abline(intercept = 0,slope = 1, col = 'grey30') +  geom_point(size=1)
+
+
+```
+
+### Step 11: B vs E bias in the meta mouse
+```{r FateBiasBinaryClassifierEB, include = TRUE}
+
+qplot(log(wt.meta.cellnorm$B+ 1) ,log(wt.meta.cellnorm$E + 1),main = "WT B vs E with cell normalisation", xlim = c(0,12),ylim = c(0,12)) + geom_abline(intercept = 0,slope = 1, col = 'grey30') +  geom_point(size=1)
+
+qplot(log(tg.meta.cellnorm$B+ 1) ,log(tg.meta.cellnorm$E + 1),main = "Tg B vs E with cell normalisation" , xlim = c(0,12),ylim = c(0,12)) + geom_abline(intercept = 0,slope = 1, col = 'grey30') +  geom_point(size=1)
+
+
+```
+
+
+
+
+
+### Step 12: Heatmaps
+We can also analyse barcode sharing by heatmap visualisation and unsupervised hierarchical clustering. We do not observe much striking differences between the WT and Tg
+
+```{r heatmap, include = TRUE}
+
+
+#heatmap with relative clone abundances
+heatmap(log(as.matrix(wt.meta[,c("B","M","E")] + 1)) ,col=colorRampPalette(c("black","green","red"),bias = 2)(300),scale = "none",distfun = function(x) dist(x,method = 'euclidean'))
+
+heatmap(log(as.matrix(tg.meta[,c("B","M","E")] + 1)) ,col=colorRampPalette(c("black","green","red"),bias = 2)(300),scale = "none",distfun = function(x) dist(x,method = 'euclidean'))
+
+#heatmap with cell-count normalisation
+heatmap(log(as.matrix(wt.meta.cellnorm[,c("B","M","E")] + 1)) ,col=colorRampPalette(c("black","green","red"),bias = 2)(300),scale = "none",distfun = function(x) dist(x,method = 'euclidean'))
+
+heatmap(log(as.matrix(tg.meta.cellnorm[,c("B","M","E")] + 1)) ,col=colorRampPalette(c("black","green","red"),bias = 2)(300),scale = "none",distfun = function(x) dist(x,method = 'euclidean'))
+
+
+```
+
+
+### Step 13: Ternary Plots
+
+Another way to look at biases across 3 lineages is to do a ternary plot. We dont observe any striking differences between WT and Tg using this visualisation.
+```{r ternaryplot, include = TRUE}
+
+
+#row-wise normalisations
+tg.meta.norm <- performRowNormalisation(tg.meta)
+wt.meta.norm <- performRowNormalisation(wt.meta)
+tg.meta.cellnorm.norm <- performRowNormalisation(tg.meta.cellnorm)
+wt.meta.cellnorm.norm <- performRowNormalisation(wt.meta.cellnorm)
+
+triax.plot(wt.meta.norm, col.symbols = "red",show.grid = T,pch = 16)
+triax.plot(tg.meta.norm, col.symbols = "blue",show.grid = T,pch = 16)
+
+triax.plot(wt.meta.cellnorm.norm, col.symbols = "red",show.grid = F,pch = 16)
+triax.plot(tg.meta.cellnorm.norm, col.symbols = "blue",show.grid = F,pch = 16)
+
+
+```
+
+### Step 14: Multi-outcome classifier with 10% threshold
+```{r multi_outcome_classifier2,  include = TRUE}
+
+threshold <- 0.1
+
+barplot(multiOutcomeClassifier(wt.meta.norm, threshold = threshold)$table,ylim = c(0,300), main = "WT")
+
+barplot(multiOutcomeClassifier(tg.meta.norm, threshold = threshold)$table,ylim = c(0,300), main = "Tg")
+
+barplot(multiOutcomeClassifier(wt.meta.cellnorm.norm, threshold = threshold)$table,ylim = c(0,300), main = "WT cellnorm")
+
+barplot(multiOutcomeClassifier(tg.meta.cellnorm.norm, threshold = threshold)$table,ylim = c(0,300), main = "Tg cellnorm")
+
+
+
+m1.wt.cellnorm.norm <- performRowNormalisation(m1.wt.cellnorm)
+barplot(multiOutcomeClassifier(m1.wt.cellnorm.norm, threshold = threshold)$table, main = "M1 WT" ,ylim = c(0,100))
+
+m2.wt.cellnorm.norm <- performRowNormalisation(m2.wt.cellnorm)
+barplot(multiOutcomeClassifier(m2.wt.cellnorm.norm, threshold = threshold)$table ,main = "M2 WT",ylim = c(0,100))
+
+m3.wt.cellnorm.norm <- performRowNormalisation(m3.wt.cellnorm)
+barplot(multiOutcomeClassifier(m3.wt.cellnorm.norm, threshold = threshold)$table,main = "M3 WT",ylim = c(0,100))
+
+m4.wt.cellnorm.norm <- performRowNormalisation(m4.wt.cellnorm)
+barplot(multiOutcomeClassifier(m4.wt.cellnorm.norm, threshold = threshold)$table,main = "M4 WT",ylim = c(0,100))
+
+
+
+m1.tg.cellnorm.norm <- performRowNormalisation(m1.tg.cellnorm)
+barplot(multiOutcomeClassifier(m1.tg.cellnorm.norm, threshold = threshold)$table ,main = "M1 Tg",ylim = c(0,100))
+
+m2.tg.cellnorm.norm <- performRowNormalisation(m2.tg.cellnorm)
+barplot(multiOutcomeClassifier(m2.tg.cellnorm.norm, threshold = threshold)$table ,main = "M2 Tg",ylim = c(0,100))
+
+m3.tg.cellnorm.norm <- performRowNormalisation(m3.tg.cellnorm)
+barplot(multiOutcomeClassifier(m3.tg.cellnorm.norm, threshold = threshold)$table,main = "M3 Tg",ylim = c(0,100))
+
+m4.tg.cellnorm.norm <- performRowNormalisation(m4.tg.cellnorm)
+barplot(multiOutcomeClassifier(m4.tg.cellnorm.norm, threshold = threshold)$table,main = "M4 Tg",ylim = c(0,100))
+
+
+
+plotClassifierLineage("B",threshold)
+plotClassifierLineage("BE",threshold)
+plotClassifierLineage("BM",threshold)
+plotClassifierLineage("BME",threshold)
+plotClassifierLineage("E",threshold)
+plotClassifierLineage("M",threshold)
+plotClassifierLineage("ME",threshold)
+
+```
+
+
+
+
+### When we sorted our cells we noticed that there were less B-cells that expressed GFP. Lets to a focused analysis to understand why this is happening
+
+
+```{r clone_sizesB, include=TRUE}
+
+wt.cumsum <- generateCumulativeProbability(wt.meta.cellnorm,"B")
+tg.cumsum <- generateCumulativeProbability(tg.meta.cellnorm,"B")
+plot(wt.cumsum$cell_counts,wt.cumsum$cumsum,col = "black",lwd = 1,
+     ylim = c(0,5e5))
+points(tg.cumsum$cell_counts,tg.cumsum$cumsum,col = "blue",lwd = 1)
+
+
+tiff("/Users/jasoncosgrove/Desktop/cumu_sum.tiff",
+     width = 8, height = 6, units = 'in', res = 300)
+wt.cumsum <- generateCumulativeProbabilityNorm(wt.meta.cellnorm,"B")
+tg.cumsum <- generateCumulativeProbabilityNorm(tg.meta.cellnorm,"B")
+
+opar <- par(lwd = 3)
+
+threshold <- 0.05
+
+
+plot(1:nrow(wt.cumsum)/nrow(wt.cumsum),wt.cumsum$cumsum,col = "black",lwd = 1,xlab = "% of all clones", ylab = "cumulative cellular output",cex.lab = 1.6)
+points(1:nrow(tg.cumsum)/nrow(tg.cumsum),tg.cumsum$cumsum,col = "blue",lwd = 1)
+axis(side = 2, lwd = 2)
+abline(h = threshold, col = "red",lty = 2,lwd = 2)
+
+dev.off()
+
+
+
+
+m1.wt <- generateCumulativeProbabilityNorm(m1.wt.cellnorm,"B")
+m2.wt <- generateCumulativeProbabilityNorm(m2.wt.cellnorm,"B")
+m3.wt <- generateCumulativeProbabilityNorm(m3.wt.cellnorm,"B")
+m4.wt <- generateCumulativeProbabilityNorm(m4.wt.cellnorm,"B")
+
+m1.tg <- generateCumulativeProbabilityNorm(m1.tg.cellnorm,"B")
+m2.tg <- generateCumulativeProbabilityNorm(m2.tg.cellnorm,"B")
+m3.tg <- generateCumulativeProbabilityNorm(m3.tg.cellnorm,"B")
+m4.tg <- generateCumulativeProbabilityNorm(m4.tg.cellnorm,"B")
+
+
+plot(1:nrow(m1.wt)/nrow(m1.wt),m1.wt$cumsum,col = "red",lwd = 1,xlim = c(0,1),
+     xlab = "% of all clones", ylab = "cumulative number of cells")
+points(1:nrow(m2.wt)/nrow(m2.wt),m2.wt$cumsum,col = "orange",lwd = 1)
+points(1:nrow(m3.wt)/nrow(m3.wt),m3.wt$cumsum,col = "dark red",lwd = 1)
+points(1:nrow(m4.wt)/nrow(m4.wt),m4.wt$cumsum,col = "yellow",lwd = 1)
+points(1:nrow(m1.tg)/nrow(m1.tg),m1.tg$cumsum,col = "blue",lwd = 1)
+points(1:nrow(m2.tg)/nrow(m2.tg),m2.tg$cumsum,col = "dark blue",lwd = 1)
+points(1:nrow(m3.tg)/nrow(m3.tg),m3.tg$cumsum,col = "green",lwd = 1)
+points(1:nrow(m4.tg)/nrow(m4.tg),m4.tg$cumsum,col = "dark green",lwd = 1)
+abline(h = threshold, col = 'red')
+text(0.2,0.05,"threshold for high output clones",srt=0.1,pos=3, col = "red",cex = 0.7)
+
+
+
+
+
+
+wt.highoutputclones <- c(
+    m1.wt %>% filter(cumsum > threshold) %>% nrow(),
+    m2.wt %>% filter(cumsum > threshold) %>% nrow(),
+    m3.wt %>% filter(cumsum > threshold) %>% nrow(),
+    m4.wt %>% filter(cumsum > threshold) %>% nrow())
+
+mean( c(m1.wt %>% filter(cumsum > threshold) %>% nrow()/nrow(m1.wt),
+            m2.wt %>% filter(cumsum > threshold) %>% nrow()/nrow(m2.wt),
+            m3.wt %>% filter(cumsum > threshold) %>% nrow()/nrow(m3.wt),
+            m4.wt %>% filter(cumsum > threshold) %>% nrow()/nrow(m4.wt)))
+
+sd( c(m1.wt %>% filter(cumsum > threshold) %>% nrow()/nrow(m1.wt),
+            m2.wt %>% filter(cumsum > threshold) %>% nrow()/nrow(m2.wt),
+            m3.wt %>% filter(cumsum > threshold) %>% nrow()/nrow(m3.wt),
+            m4.wt %>% filter(cumsum > threshold) %>% nrow()/nrow(m4.wt)))
+
+tg.highoutputclones <- c(
+    m1.tg %>% filter(cumsum > threshold) %>% nrow(),
+    m2.tg %>% filter(cumsum > threshold) %>% nrow(),
+    m3.tg %>% filter(cumsum > threshold) %>% nrow(),
+    m4.tg %>% filter(cumsum > threshold) %>% nrow())
+
+
+mean( c(m1.tg %>% filter(cumsum > threshold) %>% nrow()/nrow(m1.tg),
+            m2.tg %>% filter(cumsum > threshold) %>% nrow()/nrow(m2.tg),
+            m3.tg %>% filter(cumsum > threshold) %>% nrow()/nrow(m3.tg),
+            m4.tg %>% filter(cumsum > threshold) %>% nrow()/nrow(m4.tg)))
+
+sd( c(m1.tg %>% filter(cumsum > threshold) %>% nrow()/nrow(m1.tg),
+            m2.tg %>% filter(cumsum > threshold) %>% nrow()/nrow(m2.tg),
+            m3.tg %>% filter(cumsum > threshold) %>% nrow()/nrow(m3.tg),
+            m4.tg %>% filter(cumsum > threshold) %>% nrow()/nrow(m4.tg)))
+
+boxplot(wt.highoutputclones,
+        tg.highoutputclones ,outline = F,
+        main = "High output clones in B: clonal diversity",
+        ylab = "total number of clones per mouse",names = c("WT","Tg"), col = c("red","blue"))
+
+#data is normally distributed
+shapiro.test(c(wt.highoutputclones,
+               tg.highoutputclones))
+t.test(wt.highoutputclones,tg.highoutputclones)
+
+
+
+
+#plot the B clone size distributions for both conditions
+wt.allmice <- unlist(c(m1.wt %>% filter(cumsum > threshold) %>% select(cell_counts),
+      m2.wt %>% filter(cumsum > threshold) %>% select(cell_counts),
+      m2.wt %>% filter(cumsum > threshold) %>% select(cell_counts),
+      m2.wt %>% filter(cumsum > threshold) %>% select(cell_counts)))
+
+
+tg.allmice <- unlist(c(m1.tg %>% filter(cumsum > threshold) %>% select(cell_counts),
+      m2.tg %>% filter(cumsum > threshold) %>% select(cell_counts),
+      m2.tg %>% filter(cumsum > threshold) %>% select(cell_counts),
+      m2.tg %>% filter(cumsum > threshold) %>% select(cell_counts)))
+
+
+boxplot(wt.allmice,
+        tg.allmice ,outline = F,
+        main = "High output clones in B: clone sizes",
+        ylab = "total number of clones per mouse",names = c("WT","Tg"), col = c("red","blue"))
+
+shapiro.test(c(wt.allmice,
+               tg.allmice))
+wilcox.test(wt.allmice,tg.allmice)
+
+
+
+#now show the median clone size for each mouse
+wt.highoutputclones <- unlist(c(
+    m1.wt %>% filter(cumsum > threshold) %>% summarise(median = median(cell_counts)),
+    m2.wt %>% filter(cumsum > threshold) %>% summarise(median = median(cell_counts)),
+    m3.wt %>% filter(cumsum > threshold) %>% summarise(median = median(cell_counts)),
+    m4.wt %>% filter(cumsum > threshold) %>% summarise(median = median(cell_counts))))
+
+
+tg.highoutputclones <- unlist(c(
+    m1.tg %>% filter(cumsum > threshold) %>% summarise(median = median(cell_counts)),
+    m2.tg %>% filter(cumsum > threshold) %>% summarise(median = median(cell_counts)),
+    m3.tg %>% filter(cumsum > threshold) %>% summarise(median = median(cell_counts)),
+    m4.tg %>% filter(cumsum > threshold) %>% summarise(median = median(cell_counts))))
+
+#data is normally distributed
+
+
+
+
+boxplot(wt.highoutputclones,
+        tg.highoutputclones ,outline = F,
+        main = "High output clones in B: clone sizes",
+        ylab = "total number of clones per mouse",names = c("WT","Tg"), col = c("red","blue"))
+
+shapiro.test(c(wt.highoutputclones,
+               tg.highoutputclones))
+t.test(wt.highoutputclones,tg.highoutputclones)
+
+
+
+
+
+wt.clones <- c(m1.wt %>% filter(cumsum > 0.05) %>% rownames,
+               m2.wt %>% filter(cumsum > 0.05) %>% rownames,
+               m3.wt %>% filter(cumsum > 0.05) %>% rownames,
+               m4.wt %>% filter(cumsum > 0.05) %>% rownames)
+
+
+tg.clones <- c(m1.tg %>% filter(cumsum > 0.05) %>% rownames,
+               m2.tg %>% filter(cumsum > 0.05) %>% rownames,
+               m3.tg %>% filter(cumsum > 0.05) %>% rownames,
+               m4.tg %>% filter(cumsum > 0.05) %>% rownames)
+
+
+
+
+
+wt.subset <- wt.meta.cellnorm[wt.clones,]
+tg.subset <- tg.meta.cellnorm[tg.clones,]
+
+write.csv(wt.subset$B,"/Users/jasoncosgrove/Desktop/wt_clonesize.csv")
+write.csv(tg.subset$B,"/Users/jasoncosgrove/Desktop/tg_clonesize.csv")
+
+
+wt.subset.rownorm <- wt.meta.norm[wt.clones,]
+tg.subset.rownorm <- tg.meta.norm[tg.clones,]
+
+
+boxplot(wt.subset$M, tg.subset$M,outline = F)
+boxplot(wt.subset$E, tg.subset$E, outline = F)
+
+table(wt.subset$M > 0)
+table(tg.subset$M > 0)
+table(wt.subset$E > 0)
+table(tg.subset$E > 0)
+
+boxplot(c(wt.subset$M,wt.subset$E), c(tg.subset$M,tg.subset$E),outline = F)
+boxplot(wt.subset$E, tg.subset$E, outline = F)
+
+triax.plot(wt.subset.rownorm, col.symbols = "black",show.grid = T,pch = 16)
+triax.plot(tg.subset.rownorm, col.symbols = "blue",show.grid = T,pch = 16)
+
+
+
+
+#heatmap with cell-count normalisation
+heatmap(log(as.matrix(wt.subset[,c("B","M","E")] + 1)) ,col=colorRampPalette(c("black","green","red"),bias = 2)(300),scale = "none",distfun = function(x) dist(x,method = 'euclidean'))
+
+heatmap(log(as.matrix(tg.subset[,c("B","M","E")] + 1)) ,col=colorRampPalette(c("black","green","red"),bias = 2)(300),scale = "none",distfun = function(x) dist(x,method = 'euclidean'))
+
+boxplot(wt.subset.rownorm$B, tg.subset.rownorm$B,
+        wt.subset.rownorm$M, tg.subset.rownorm$M,
+        wt.subset.rownorm$E, tg.subset.rownorm$E)
+
+
+wilcox.test(wt.subset.rownorm$B, tg.subset.rownorm$B)
+wilcox.test(wt.subset.rownorm$M, tg.subset.rownorm$M)
+wilcox.test(wt.subset.rownorm$E, tg.subset.rownorm$E)
+write.csv(wt.subset.rownorm,"/Users/jasoncosgrove/Desktop/wt_rownorm.csv")
+write.csv(tg.subset.rownorm,"/Users/jasoncosgrove/Desktop/tg_rownorm.csv")
+
+wt.subset.cellnorm <- wt.meta.cellnorm[wt.clones,]
+tg.subset.cellnorm <- tg.meta.cellnorm[tg.clones,]
+
+wt.subset.cellnorm.rownorm <- performRowNormalisation(wt.subset.cellnorm)
+tg.subset.cellnorm.rownorm <- performRowNormalisation(tg.subset.cellnorm)
+
+boxplot(wt.subset.cellnorm.rownorm$B, tg.subset.cellnorm.rownorm$B,
+        wt.subset.cellnorm.rownorm$M, tg.subset.cellnorm.rownorm$M,
+        wt.subset.cellnorm.rownorm$E, tg.subset.cellnorm.rownorm$E)
+
+
+wilcox.test(wt.subset.cellnorm.rownorm$B, tg.subset.cellnorm.rownorm$B)
+wilcox.test(wt.subset.cellnorm.rownorm$M, tg.subset.cellnorm.rownorm$M)
+wilcox.test(wt.subset.cellnorm.rownorm$E, tg.subset.cellnorm.rownorm$E)
+
+
+boxplot(wt.subset.rownorm$B, tg.subset.rownorm$B,
+        wt.subset.rownorm$M, tg.subset.rownorm$M,
+        wt.subset.rownorm$E, tg.subset.rownorm$E)
+
+```
+#lets run the same analysis in the other lineages to see if it's really a B-cell specific phenomenon
+```{r clone_sizesM, include=TRUE}
+
+wt.cumsum <- generateCumulativeProbability(wt.meta.cellnorm,"M")
+tg.cumsum <- generateCumulativeProbability(tg.meta.cellnorm,"M")
+plot(wt.cumsum$cell_counts,wt.cumsum$cumsum,col = "red",lwd = 1,
+     ylim = c(0,5e5))
+points(tg.cumsum$cell_counts,tg.cumsum$cumsum,col = "blue",lwd = 1)
+
+
+tiff("/Users/jasoncosgrove/Desktop/cumu_sum.tiff",
+     width = 8, height = 6, units = 'in', res = 300)
+wt.cumsum <- generateCumulativeProbabilityNorm(wt.meta.cellnorm,"M")
+tg.cumsum <- generateCumulativeProbabilityNorm(tg.meta.cellnorm,"M")
+
+opar <- par(lwd = 3)
+
+plot(1:nrow(wt.cumsum)/nrow(wt.cumsum),wt.cumsum$cumsum,col = "black",lwd = 1,xlab = "% of all clones", ylab = "cumulative cellular output",cex.lab = 1.6)
+points(1:nrow(tg.cumsum)/nrow(tg.cumsum),tg.cumsum$cumsum,col = "blue",lwd = 1)
+axis(side = 2, lwd = 2)
+abline(h = 0.05, col = "red",lty = 2,lwd = 2)
+
+dev.off()
+
+
+
+m1.wt <- generateCumulativeProbabilityNorm(m1.wt.cellnorm,"M")
+m2.wt <- generateCumulativeProbabilityNorm(m2.wt.cellnorm,"M")
+m3.wt <- generateCumulativeProbabilityNorm(m3.wt.cellnorm,"M")
+m4.wt <- generateCumulativeProbabilityNorm(m4.wt.cellnorm,"M")
+
+m1.tg <- generateCumulativeProbabilityNorm(m1.tg.cellnorm,"M")
+m2.tg <- generateCumulativeProbabilityNorm(m2.tg.cellnorm,"M")
+m3.tg <- generateCumulativeProbabilityNorm(m3.tg.cellnorm,"M")
+m4.tg <- generateCumulativeProbabilityNorm(m4.tg.cellnorm,"M")
+
+
+plot(1:nrow(m1.wt)/nrow(m1.wt),m1.wt$cumsum,col = "red",lwd = 1,xlim = c(0,1),
+     xlab = "% of all clones", ylab = "cumulative number of cells")
+points(1:nrow(m2.wt)/nrow(m2.wt),m2.wt$cumsum,col = "orange",lwd = 1)
+points(1:nrow(m3.wt)/nrow(m3.wt),m3.wt$cumsum,col = "dark red",lwd = 1)
+points(1:nrow(m4.wt)/nrow(m4.wt),m4.wt$cumsum,col = "yellow",lwd = 1)
+points(1:nrow(m1.tg)/nrow(m1.tg),m1.tg$cumsum,col = "blue",lwd = 1)
+points(1:nrow(m2.tg)/nrow(m2.tg),m2.tg$cumsum,col = "dark blue",lwd = 1)
+points(1:nrow(m3.tg)/nrow(m3.tg),m3.tg$cumsum,col = "green",lwd = 1)
+points(1:nrow(m4.tg)/nrow(m4.tg),m4.tg$cumsum,col = "dark green",lwd = 1)
+abline(h = 0.05, col = 'red')
+text(0.2,0.05,"threshold for high output clones",srt=0.1,pos=3, col = "red",cex = 0.7)
+
+
+
+wt.highoutputclones <- c(
+    m1.wt %>% filter(cumsum > 0.05) %>% nrow(),
+    m2.wt %>% filter(cumsum > 0.05) %>% nrow(),
+    m3.wt %>% filter(cumsum > 0.05) %>% nrow(),
+    m4.wt %>% filter(cumsum > 0.05) %>% nrow())
+
+
+tg.highoutputclones <- c(
+    m1.tg %>% filter(cumsum > 0.05) %>% nrow(),
+    m2.tg %>% filter(cumsum > 0.05) %>% nrow(),
+    m3.tg %>% filter(cumsum > 0.05) %>% nrow(),
+    m4.tg %>% filter(cumsum > 0.05) %>% nrow())
+
+
+boxplot(wt.highoutputclones,
+        tg.highoutputclones ,outline = F,
+        main = "High output clones in M: clonal diversity",
+        ylab = "total number of clones per mouse",names = c("WT","Tg"), col = c("red","blue"))
+
+#data is normally distributed
+shapiro.test(c(wt.highoutputclones,
+               tg.highoutputclones))
+t.test(wt.highoutputclones,tg.highoutputclones)
+
+
+
+
+wt.highoutputclones <- unlist(c(
+    m1.wt %>% filter(cumsum > 0.05) %>% summarise(median = median(cell_counts)),
+    m2.wt %>% filter(cumsum > 0.05) %>% summarise(median = median(cell_counts)),
+    m3.wt %>% filter(cumsum > 0.05) %>% summarise(median = median(cell_counts)),
+    m4.wt %>% filter(cumsum > 0.05) %>% summarise(median = median(cell_counts))))
+
+
+tg.highoutputclones <- unlist(c(
+    m1.tg %>% filter(cumsum > 0.05) %>% summarise(median = median(cell_counts)),
+    m2.tg %>% filter(cumsum > 0.05) %>% summarise(median = median(cell_counts)),
+    m3.tg %>% filter(cumsum > 0.05) %>% summarise(median = median(cell_counts)),
+    m4.tg %>% filter(cumsum > 0.05) %>% summarise(median = median(cell_counts))))
+
+#data is normally distributed
+
+boxplot(wt.highoutputclones,
+        tg.highoutputclones ,outline = F,
+        main = "High output clones in M: clone sizes",
+        ylab = "total number of clones per mouse",names = c("WT","Tg"), col = c("red","blue"))
+
+shapiro.test(c(wt.highoutputclones,
+               tg.highoutputclones))
+t.test(wt.highoutputclones,tg.highoutputclones)
+
+
+
+```
+
+
+
+#lets run the same analysis in the other lineages to see if it's really a B-cell specific phenomenon
+```{r clone_sizesE, include=TRUE}
+
+wt.cumsum <- generateCumulativeProbability(wt.meta.cellnorm,"E")
+tg.cumsum <- generateCumulativeProbability(tg.meta.cellnorm,"E")
+plot(wt.cumsum$cell_counts,wt.cumsum$cumsum,col = "red",lwd = 1,
+     ylim = c(0,5e5))
+points(tg.cumsum$cell_counts,tg.cumsum$cumsum,col = "blue",lwd = 1)
+
+
+tiff("/Users/jasoncosgrove/Desktop/cumu_sum.tiff",
+     width = 8, height = 6, units = 'in', res = 300)
+wt.cumsum <- generateCumulativeProbabilityNorm(wt.meta.cellnorm,"E")
+tg.cumsum <- generateCumulativeProbabilityNorm(tg.meta.cellnorm,"E")
+
+opar <- par(lwd = 3)
+
+plot(1:nrow(wt.cumsum)/nrow(wt.cumsum),wt.cumsum$cumsum,col = "black",lwd = 1,xlab = "% of all clones", ylab = "cumulative cellular output",cex.lab = 1.6)
+points(1:nrow(tg.cumsum)/nrow(tg.cumsum),tg.cumsum$cumsum,col = "blue",lwd = 1)
+axis(side = 2, lwd = 2)
+abline(h = 0.05, col = "red",lty = 2,lwd = 2)
+
+dev.off()
+
+
+
+m1.wt <- generateCumulativeProbabilityNorm(m1.wt.cellnorm,"E")
+m2.wt <- generateCumulativeProbabilityNorm(m2.wt.cellnorm,"E")
+m3.wt <- generateCumulativeProbabilityNorm(m3.wt.cellnorm,"E")
+m4.wt <- generateCumulativeProbabilityNorm(m4.wt.cellnorm,"E")
+
+m1.tg <- generateCumulativeProbabilityNorm(m1.tg.cellnorm,"E")
+m2.tg <- generateCumulativeProbabilityNorm(m2.tg.cellnorm,"E")
+m3.tg <- generateCumulativeProbabilityNorm(m3.tg.cellnorm,"E")
+m4.tg <- generateCumulativeProbabilityNorm(m4.tg.cellnorm,"E")
+
+
+plot(1:nrow(m1.wt)/nrow(m1.wt),m1.wt$cumsum,col = "red",lwd = 1,xlim = c(0,1),
+     xlab = "% of all clones", ylab = "cumulative number of cells")
+points(1:nrow(m2.wt)/nrow(m2.wt),m2.wt$cumsum,col = "orange",lwd = 1)
+points(1:nrow(m3.wt)/nrow(m3.wt),m3.wt$cumsum,col = "dark red",lwd = 1)
+points(1:nrow(m4.wt)/nrow(m4.wt),m4.wt$cumsum,col = "yellow",lwd = 1)
+points(1:nrow(m1.tg)/nrow(m1.tg),m1.tg$cumsum,col = "blue",lwd = 1)
+points(1:nrow(m2.tg)/nrow(m2.tg),m2.tg$cumsum,col = "dark blue",lwd = 1)
+points(1:nrow(m3.tg)/nrow(m3.tg),m3.tg$cumsum,col = "green",lwd = 1)
+points(1:nrow(m4.tg)/nrow(m4.tg),m4.tg$cumsum,col = "dark green",lwd = 1)
+abline(h = 0.05, col = 'red')
+text(0.2,0.05,"threshold for high output clones",srt=0.1,pos=3, col = "red",cex = 0.7)
+
+wt.highoutputclones <- c(
+    m1.wt %>% filter(cumsum > 0.05) %>% nrow(),
+    m2.wt %>% filter(cumsum > 0.05) %>% nrow(),
+    m3.wt %>% filter(cumsum > 0.05) %>% nrow(),
+    m4.wt %>% filter(cumsum > 0.05) %>% nrow())
+
+
+tg.highoutputclones <- c(
+    m1.tg %>% filter(cumsum > 0.05) %>% nrow(),
+    m2.tg %>% filter(cumsum > 0.05) %>% nrow(),
+    m3.tg %>% filter(cumsum > 0.05) %>% nrow(),
+    m4.tg %>% filter(cumsum > 0.05) %>% nrow())
+
+
+boxplot(wt.highoutputclones,
+        tg.highoutputclones ,outline = F,
+        main = "High output clones in E: clonal diversity",
+        ylab = "total number of clones per mouse",names = c("WT","Tg"), col = c("red","blue"))
+
+#data is normally distributed
+shapiro.test(c(wt.highoutputclones,
+               tg.highoutputclones))
+t.test(wt.highoutputclones,tg.highoutputclones)
+
+
+
+
+wt.highoutputclones <- unlist(c(
+    m1.wt %>% filter(cumsum > 0.05) %>% summarise(median = median(cell_counts)),
+    m2.wt %>% filter(cumsum > 0.05) %>% summarise(median = median(cell_counts)),
+    m3.wt %>% filter(cumsum > 0.05) %>% summarise(median = median(cell_counts)),
+    m4.wt %>% filter(cumsum > 0.05) %>% summarise(median = median(cell_counts))))
+
+
+tg.highoutputclones <- unlist(c(
+    m1.tg %>% filter(cumsum > 0.05) %>% summarise(median = median(cell_counts)),
+    m2.tg %>% filter(cumsum > 0.05) %>% summarise(median = median(cell_counts)),
+    m3.tg %>% filter(cumsum > 0.05) %>% summarise(median = median(cell_counts)),
+    m4.tg %>% filter(cumsum > 0.05) %>% summarise(median = median(cell_counts))))
+
+#data is normally distributed
+
+boxplot(wt.highoutputclones,
+        tg.highoutputclones ,outline = F,
+        main = "High output clones in E: clone sizes",
+        ylab = "total number of clones per mouse",names = c("WT","Tg"), col = c("red","blue"))
+
+shapiro.test(c(wt.highoutputclones,
+               tg.highoutputclones))
+wilcox.test(wt.highoutputclones,tg.highoutputclones)
+
+
+
+```
