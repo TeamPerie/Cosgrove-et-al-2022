@@ -1,0 +1,3097 @@
+---
+title: "ChIC_Analysis_1.Rmd"
+author: "Gregoire Jouault"
+date: "2025-11-13"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+```{r}
+library(here)
+source(file.path(here(),"Scripts","global_var.R"))
+maindir = here()
+set.seed(1)
+palette_color = c(brewer.pal(name = "Set3", n = 12),brewer.pal(name = "Paired", n = 12))
+library(SummarizedExperiment)
+library(GenomicRanges)
+
+# chromVAR
+library(chromVAR)
+library(motifmatchr)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(JASPAR2020)
+library(TFBSTools)
+library(ggpointdensity)
+```
+
+######## Final processing ##########
+Bam files contains lot of PCR duplicates (seen when creating fragment files)
+So plan is to : 
+ - Create Fragment file per sample using the bam 
+ - Filter bad cells ??
+ - Call peaks per sample ?
+
+```{r Create Fragment file per sample}
+library(parallel)
+
+# --- Paths and parameters ---
+maindir        <- "/Users/gjouault/Documents/Institut_Curie/Projects/Collabs/ChIC_Perie"
+bam_dir        <- file.path(maindir, "Input", "Bams")
+
+frag_dir_raw   <- file.path(maindir, "Input", "Fragments_raw")  # raw counts, plain TSV
+frag_dir_bin   <- file.path(maindir, "Input", "Fragments_bin")  # binarized, bgzip + tabix
+
+dir.create(frag_dir_raw, showWarnings = FALSE)
+dir.create(frag_dir_bin, showWarnings = FALSE)
+
+# BAM files
+bam_files_full  <- list.files(bam_dir, pattern = ".bam$", full.names = TRUE)
+bam_files_short <- gsub("(.*).bam", "\\1",
+                        list.files(bam_dir, pattern = ".bam$", full.names = FALSE))
+
+# --- Parallel fragment generation loop ---
+mclapply(seq_along(bam_files_short), function(i) {
+  
+  sample_path <- bam_files_full[i]
+  sample_name <- bam_files_short[i]
+  
+  message("\n===== Creating fragment files for sample: ", sample_name, " =====")
+  
+  # RAW FRAGMENTS (with counts) - kept as sorted TSV only
+  frag_unsorted_raw <- file.path(frag_dir_raw, paste0(sample_name, ".fragments.unsorted.tsv"))
+  frag_sorted_raw   <- file.path(frag_dir_raw, paste0(sample_name, ".fragments.tsv"))
+  log_file          <- file.path(frag_dir_raw, paste0(sample_name, "_sinto_fragments.log"))
+  
+  ## 1) sinto fragments: raw, with true counts
+  cmd_sinto <- paste(
+    "conda run -n Env_macs3 sinto fragments",
+    "-f", shQuote(frag_unsorted_raw),
+    "-b", shQuote(sample_path),
+    "-p 2",
+    "--barcodetag SM",
+    "--use_chrom \"\"",
+    "--shift_plus 0",
+    "--shift_minus 0",
+    "--collapse_within",
+    ">",
+    shQuote(log_file), "2>&1"
+  )
+  message("Running sinto: ", cmd_sinto)
+  system(cmd_sinto)
+  
+  ## 2) sort raw fragments by chr, start
+  cmd_sort_raw <- paste(
+    "sort -k1,1 -k2,2n", shQuote(frag_unsorted_raw),
+    ">",
+    shQuote(frag_sorted_raw),
+    "2>>", shQuote(log_file)
+  )
+  message("Running sort (raw): ", cmd_sort_raw)
+  system(cmd_sort_raw)
+  
+  ## 3) remove unsorted intermediate
+  unlink(frag_unsorted_raw)
+  
+  # BINARIZED FRAGMENTS (counts set to 1) - sorted, bgzip + tabix
+  message("Creating binarized fragment file (PCR-dedup view) for sample: ", sample_name)
+  
+  frag_sorted_bin <- file.path(frag_dir_bin, paste0(sample_name, ".fragments.tsv"))
+  frag_gz_bin     <- paste0(frag_sorted_bin, ".gz")
+  
+  # Set 5th column to 1 and add "chr" prefix to column 1 (if not already there)
+  cmd_bin <- paste(
+    "awk 'BEGIN{OFS=\"\\t\"} {",
+      "if ($1 !~ /^chr/) $1 = \"chr\" $1;",  # add chr if missing
+      "if (NF>=5) $5 = 1;",                  # binarize count
+      "print",
+    "}'",
+    shQuote(frag_sorted_raw),
+    ">",
+    shQuote(frag_sorted_bin),
+    "2>>", shQuote(log_file)
+  )
+  message("Running binarization + chr prefix: ", cmd_bin)
+  system(cmd_bin)
+  
+  # bgzip + tabix on binarized file
+  cmd_bgzip_bin <- paste(
+    "bgzip -f", shQuote(frag_sorted_bin),
+    "2>>", shQuote(log_file)
+  )
+  message("Running bgzip (bin): ", cmd_bgzip_bin)
+  system(cmd_bgzip_bin)
+  
+  cmd_tabix_bin <- paste(
+    "tabix -p bed", shQuote(frag_gz_bin),
+    "2>>", shQuote(log_file)
+  )
+  message("Running tabix (bin): ", cmd_tabix_bin)
+  system(cmd_tabix_bin)
+  
+  message("Finished raw + binarized fragment files for: ", sample_name)
+  
+}, mc.cores = 4)
+
+```
+
+```{r Get percentage of duplicates per sample}
+
+bam_dir        <- file.path(maindir, "Input", "Bams")
+
+frag_dir_raw   <- file.path(maindir, "Input", "Fragments_raw")  # raw counts, plain TSV
+
+frag_files <- list.files(
+  frag_dir_raw,
+  pattern = "fragments.tsv$",
+  full.names = TRUE
+)
+
+# Sample names = basename without .fragments.tsv
+sample_names <- sub("\\.fragments\\.tsv$", "", basename(frag_files))
+
+# --- Function to compute stats for one file ---
+compute_fragment_stats <- function(file, sample_name) {
+  message("Processing: ", sample_name, " (", file, ")")
+
+  frag <- read.table(
+    file,
+    sep = "\t",
+    header = FALSE,
+    stringsAsFactors = FALSE,
+    col.names = c("chr", "start", "end", "cell", "count")
+  )
+
+  n_dedup_fragments <- nrow(frag)
+  n_total_fragments <- sum(frag$count, na.rm = TRUE)
+
+  data.frame(
+    sample            = sample_name,
+    n_dedup_fragments = n_dedup_fragments,
+    n_total_fragments = n_total_fragments,
+    stringsAsFactors  = FALSE
+  )
+}
+
+# --- Loop over all fragment files ---
+stats_list <- mapply(
+  compute_fragment_stats,
+  file        = frag_files,
+  sample_name = sample_names,
+  SIMPLIFY    = FALSE
+)
+
+fragment_stats <- do.call(rbind, stats_list)
+
+pdf(file.path(maindir, "Output", "Barplot_PCR_Duplicates_per_sample.pdf"), width = 9)
+fragment_stats %>% mutate(n_unique = n_dedup_fragments, n_duplicated = n_total_fragments - n_dedup_fragments, prop_unique  = n_unique / n_total_fragments, prop_duplicated = n_duplicated / n_total_fragments) %>%  
+  dplyr::select(sample, prop_unique, prop_duplicated) %>%
+  pivot_longer(cols = c(prop_unique, prop_duplicated),names_to = "type",values_to = "proportion") %>%
+  mutate(type = recode(type, prop_unique = "Unique fragments", prop_duplicated = "Duplicated fragments")) %>% ggplot(aes(x = sample, y = proportion, fill = type)) +
+  geom_bar(stat = "identity") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Sample",
+    y = "Proportion of fragments",
+    fill = "",
+    title = "Proportion of unique vs duplicated fragments per sample"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1), 
+     plot.margin  = margin(l = 40)
+  )
+
+fragment_stats %>% mutate(n_unique = n_dedup_fragments, n_duplicated = n_total_fragments - n_dedup_fragments, prop_unique  = n_unique / n_total_fragments, prop_duplicated = n_duplicated / n_total_fragments) %>%  
+  dplyr::select(sample, n_unique, n_duplicated) %>%
+  pivot_longer(cols = c(n_unique,n_duplicated),names_to = "type",values_to = "count") %>%
+  mutate(type = recode(type, n_unique = "Unique fragments", n_duplicated = "Duplicated fragments")) %>% ggplot(aes(x = sample, y = count, fill = type)) +
+  geom_bar(stat = "identity") +
+  labs(
+    x = "Sample",
+    y = "Number of fragments",
+    fill = "",
+    title = "Number of unique vs duplicated fragments per sample"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1), 
+    plot.margin  = margin(l = 40)
+  )
+dev.off()
+```
+
+```{r Compute matrices on 50K to filter out bad cells}
+# feature_Granges = define_feature(ref = "mm10", bin_width = 50000)
+# FeatureMatrix_50K = wrapper_Signac_FeatureMatrix(file.path(maindir,"Input", "Fragments_bin"), which = feature_Granges, ref = "mm10", process_n = 30000)
+# qs::qsave(FeatureMatrix_50K, file.path(maindir, "Input", "FeatureMatrix_50K.qs"))
+
+FeatureMatrix_50K = qs::qread(file.path(maindir, "Input", "FeatureMatrix_50K.qs"))
+datamatrix = FeatureMatrix_50K$datamatrix
+annot_raw = FeatureMatrix_50K$annot_raw
+
+annot_raw$sample_id = sub(".fragments","", annot_raw$sample_id)
+annot_raw$cell_id = sub(".fragments","", annot_raw$cell_id)
+
+
+colnames(datamatrix) = annot_raw$cell_id
+rownames(annot_raw) = annot_raw$cell_id
+
+ scExp_50K = create_scExp(datamatrix, annot_raw,
+                         remove_zero_cells = TRUE,
+                         remove_zero_features = TRUE)
+ 
+pdf(file.path(maindir, "Output", "Histogram_number_fragments_per_cell.pdf"), width = 9)
+
+as.data.frame(colData(scExp_50K)) %>%  ggplot(aes(x = log10(total_counts))) +
+  geom_histogram(bins = 50, fill = "grey70", color = "black") +
+  labs(
+    x = "log10(# fragments per cell)",
+    y = "Number of cells",
+    title = "Fragments per cell for all sample"
+  ) +
+  theme_bw()
+
+  as.data.frame(colData(scExp_50K)) %>%  ggplot(aes(x = log10(total_counts))) +
+  geom_histogram(bins = 50, fill = "grey70", color = "black") +
+  facet_wrap(~ sample_id, scales = "free_y") +
+  labs(
+    x = "log10(# fragments per cell)",
+    y = "Number of cells",
+    title = "Fragments per cell per sample"
+  ) +
+  theme_bw()
+  dev.off()
+  
+   
+   plot_distribution_scExp(scExp_50K, log10 = T) 
+ 
+ scExp_50K = filter_scExp(
+        scExp_50K,
+        min_cov_cell = 1000,
+        quant_removal = 95, 
+        min_count_per_feature = 100)
+ 
+  pdf(file.path(maindir, "Output", "Barplot_number_of_cell_persample_after_filtering_1000frags.pdf"), width = 9)
+
+as.data.frame(colData(scExp_50K)) %>%  ggplot(aes(x = sample_id, fill = sample_id)) +
+  geom_bar() +
+  labs(
+    x = "Sample",
+    y = "Number of cells",
+    title = "Number of cells per sample after filtering \n out cells < 1000 fragments per cell"
+  ) +
+  theme_bw() + 
+  theme(
+    axis.text.x  = element_blank(),   # remove text
+    axis.ticks.x = element_blank()    # remove tick marks
+  )
+dev.off()
+  
+ 
+ scExp_50K = find_top_features(
+        scExp_50K,
+        n = nrow(scExp_50K),
+        keep_others = FALSE)
+ 
+  scExp_50K = normalize_scExp(scExp_50K, type = "TFIDF")
+    
+  scExp_50K = feature_annotation_scExp(scExp_50K, ref = "mm10")
+   
+  scExp_50K = reduce_dims_scExp(
+        scExp_50K, n = 20,
+        dimension_reductions = c("PCA"),
+        batch_correction = FALSE, batch_list = NULL,  
+        remove_PC = NULL,
+        verbose = FALSE)
+    
+  plot_correlation_PCA_scExp(
+        scExp_50K,
+        correlation_var = "total_counts",
+        color_by = NULL,
+        topPC = 20)
+  
+  scExp_50K = reduce_dims_scExp(
+        scExp_50K, n = 20,
+        dimension_reductions = c("PCA","UMAP"), #, "TSNE"),
+        batch_correction = FALSE, batch_list = NULL,  
+        remove_PC = c("Component_1"),
+        verbose = FALSE)
+    
+  plot_correlation_PCA_scExp(
+        scExp_50K,
+        correlation_var = "total_counts",
+        color_by = NULL,
+        topPC = 20)
+  
+   scExp_50K = ChromSCape::find_clusters_louvain_scExp(scExp_50K, resolution = 1)
+  
+  plot_reduced_dim_scExp(scExp_50K, color_by = "cell_cluster", reduced_dim = "UMAP", transparency = 0.5, size = 0.2, downsample = dim(scExp_50K)[2], min_quantile = 0, max_quantile = 1, annotate_clusters = F)
+  
+    df_plot_50K = cbind(as.data.frame(colData(scExp_50K)),as.data.frame(reducedDim(scExp_50K, "UMAP")))
+  df_plot_50K = df_plot_50K[sample(1:nrow(df_plot_50K)), ]
+  
+  df_plot_50K <- df_plot_50K %>%
+  mutate(group_id = case_when(
+    sample_id %in% c(
+      "CD62L-_stem_cells_no_drug_tagged",
+      "CD62L-_stem_cells_with_drug_tagged",
+      "CD62L+_stem_cells_no_drug_tagged",
+      "CD62L+_stem_cells_with_drug_tagged"
+    ) ~ "stem_cells",
+    sample_id %in% c(
+      "m61_m66_WT_62hi_tagged",
+      "m61_m66_WT_62neg_tagged",
+      "m64_m68_Tg_62hi_tagged",
+      "m64_m68_Tg_62neg_tagged"
+    ) ~ "mouse",
+    TRUE ~ NA_character_
+  ))
+  
+   pdf(file.path(maindir, "Output", "UMAP_filtered_cells_50Kbins_all_samples.pdf"), width = 9)
+   
+  df_plot_50K %>% ggplot(aes(x = Component_1, y = Component_2, fill = cell_cluster)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_manual(values = palette_color) + theme_void() +
+   df_plot_50K %>% ggplot(aes(x = Component_1, y = Component_2, fill = log10(total_counts))) + geom_point(shape = 21, color = "grey70", size = 3) + theme_void() + scale_fill_viridis(option = "D") +
+  df_plot_50K %>% ggplot(aes(x = Component_1, y = Component_2, fill = sample_id)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_brewer(palette = "Set3") + theme_void() + 
+      df_plot_50K %>% ggplot(aes(x = Component_1, y = Component_2, fill = group_id)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_brewer(palette = "Set3") + theme_void()
+  
+  dev.off()
+  
+  ## Save objects 
+  colData(scExp_50K) <- colData(scExp_50K) %>% as.data.frame() %>%
+  mutate(group_id = case_when(
+    sample_id %in% c(
+      "CD62L-_stem_cells_no_drug_tagged",
+      "CD62L-_stem_cells_with_drug_tagged",
+      "CD62L+_stem_cells_no_drug_tagged",
+      "CD62L+_stem_cells_with_drug_tagged"
+    ) ~ "stem_cells",
+    sample_id %in% c(
+      "m61_m66_WT_62hi_tagged",
+      "m61_m66_WT_62neg_tagged",
+      "m64_m68_Tg_62hi_tagged",
+      "m64_m68_Tg_62neg_tagged"
+    ) ~ "mouse",
+    TRUE ~ NA_character_
+  )) %>% DataFrame()
+  
+  qs::qsave(scExp_50K, file.path(maindir, "Output","Objects","scExp_50K_all_samples.qs"))
+  col_data = as.data.frame(colData(scExp_50K))
+  write.csv(col_data,file.path(maindir, "Output","Objects","coldata_scExp50K_all_samples.csv"))
+  
+   scExp_50K_da = differential_analysis_scExp(scExp_50K, de_type = "custom", by = c("sample_id", "sample_id"),group = data.frame(group = c("CD62L-_stem_cells_with_drug_tagged")), ref = data.frame(ref = c("CD62L-_stem_cells_no_drug_tagged")), prioritize_genes = F, method = "wilcox")
+    DA = as.data.frame(rowData(scExp_50K_da))
+
+```
+
+```{r Use those Fragment files to create bw}
+library(parallel)
+
+#### --- Paths and parameters ---
+maindir      <- "/Users/gjouault/Documents/Institut_Curie/Projects/Collabs/ChIC_Perie"
+
+frag_dir     <- file.path(maindir, "Input", "Fragments")
+bw_dir       <- file.path(maindir, "Input", "Bigwigs_from_fragments")
+dir.create(bw_dir, showWarnings = FALSE)
+
+chrom_sizes  <- file.path(maindir, "Annotations", "mm10.chrom.sizes")
+
+# Fragment files: e.g. sample.fragments.tsv.gz
+frag_files <- list.files(
+  frag_dir,
+  pattern = "\\.fragments\\.tsv\\.gz$",
+  full.names = TRUE
+)
+
+# Sample names without extension
+sample_names <- sub("\\.fragments\\.tsv\\.gz$", "", basename(frag_files))
+
+#### --- Parallel loop: fragment -> bedGraph -> bigWig ---
+mclapply(seq_along(frag_files), function(i) {
+  
+  frag_file     <- frag_files[i]
+  sample_name   <- sample_names[i]
+  
+  message("\n===== Creating bigWig from fragments for sample: ", sample_name, " =====")
+  
+  bedgraph_file <- file.path(bw_dir, paste0(sample_name, ".bedGraph"))
+  bw_file       <- file.path(bw_dir, paste0(sample_name, ".bw"))
+  log_file      <- file.path(bw_dir, paste0(sample_name, "_frag2bw.log"))
+  
+  ## 1) zcat + cut + bedtools genomecov → bedGraph
+  cmd_bg <- paste(
+    "zcat", shQuote(frag_file),
+    "| cut -f1-3",
+    "| bedtools genomecov -i - -g", shQuote(chrom_sizes), "-bg",
+    ">",
+    shQuote(bedgraph_file),
+    "2>",
+    shQuote(log_file)
+  )
+  message("Running bedGraph generation: ", cmd_bg)
+  system(cmd_bg)
+  
+  ## 2) bedGraphToBigWig → bigWig
+  cmd_bw <- paste(
+    "bedGraphToBigWig",
+    shQuote(bedgraph_file),
+    shQuote(chrom_sizes),
+    shQuote(bw_file),
+    "2>>",
+    shQuote(log_file)
+  )
+  message("Running bedGraphToBigWig: ", cmd_bw)
+  system(cmd_bw)
+  
+  ## (Optional) remove intermediate bedGraph
+  # unlink(bedgraph_file)
+  
+  message("Finished bigWig for: ", sample_name)
+  
+}, mc.cores = 2)   # adjust cores if you like
+
+```
+
+```{r Make coverage plots of interesting regions}
+
+library(plotgardener)
+
+dir.create(file.path(maindir, "Output", "Coverage_plots"), recursive = T)
+regions = list(
+  c("Spi1","chr2",91079399, 91098927),
+  c("Gata2","chr6",88198125, 88208992),
+  c("Runx1","chr16",92793525,92833933), 
+  c("Cebpa", "chr7", 35117910, 35124004), 
+  c("Ikzf1","chr11",11678828, 11776077),
+  c("Tcf3","chr10",80407087,80436966), 
+  c("Ebf1", "chr11", 44589967, 45036535), 
+  c("Pax5", "chr4", 44522748,44712694),
+  c("Foxo1", "chr3", 52266337, 52352109)
+)
+
+Stemcells_CD62Lneg_with_drug = rtracklayer::import(file.path(maindir, "Input", "Bigwigs", "CD62L+_stem_cells_with_drug_tagged.bw"))
+Stemcells_CD62Lneg_no_drug = rtracklayer::import(file.path(maindir, "Input", "Bigwigs", "CD62L+_stem_cells_no_drug_tagged.bw"))
+Stemcells_CD62Lpos_with_drug = rtracklayer::import(file.path(maindir, "Input", "Bigwigs", "CD62L-_stem_cells_with_drug_tagged.bw"))
+Stemcells_CD62Lpos_no_drug = rtracklayer::import(file.path(maindir, "Input", "Bigwigs", "CD62L-_stem_cells_no_drug_tagged.bw"))
+
+Mouse_62neg_TG = rtracklayer::import(file.path(maindir, "Input", "Bigwigs", "m64_m68_Tg_62neg_tagged.bw"))
+Mouse_62neg_WT = rtracklayer::import(file.path(maindir, "Input", "Bigwigs", "m61_m66_WT_62neg_tagged.bw"))
+Mouse_62hi_TG = rtracklayer::import(file.path(maindir, "Input", "Bigwigs", "m64_m68_Tg_62hi_tagged.bw"))
+Mouse_62hi_WT = rtracklayer::import(file.path(maindir, "Input", "Bigwigs", "m61_m66_WT_62hi_tagged.bw"))
+
+seqlevelsStyle(Stemcells_CD62Lneg_with_drug) <- "UCSC"
+seqlevelsStyle(Stemcells_CD62Lneg_no_drug)   <- "UCSC"
+seqlevelsStyle(Stemcells_CD62Lpos_with_drug) <- "UCSC"
+seqlevelsStyle(Stemcells_CD62Lpos_no_drug)   <- "UCSC"
+
+seqlevelsStyle(Mouse_62neg_TG) <- "UCSC"
+seqlevelsStyle(Mouse_62neg_WT) <- "UCSC"
+seqlevelsStyle(Mouse_62hi_TG)  <- "UCSC"
+seqlevelsStyle(Mouse_62hi_WT)  <- "UCSC"
+
+###Load Mouse annotation#########
+Genebed = rtracklayer::readGFF(filepath = file.path(maindir,"Annotations","gencode.vM10.annotation.gtf.gz"))
+subGenebed <-  Genebed %>% dplyr::filter(gene_type == "protein_coding" & type == "gene")
+genebed <- data.frame(chrom=subGenebed$seqid,start=subGenebed$start,stop=subGenebed$end,gene=subGenebed$gene_name,score=".",strand=subGenebed$strand)
+genebed$chrom = as.character(genebed$chrom)
+genebed$gene = as.character(genebed$gene)
+
+for (i in c(1:length(regions))){
+  
+#Select region of interest
+    region=regions[[i]][1]
+    chrom=regions[[i]][2]
+    chromstart=as.numeric(regions[[i]][3])
+    chromend=as.numeric(regions[[i]][4])
+    
+    roi = GRanges(chrom,ranges = IRanges(chromstart,chromend), Gene=region)
+    
+    cat("Doing plot for ",region,"",chrom,":",chromstart,"-",chromend,".\n")
+    gl.sub <- genebed[ which(genebed[,"chrom"] == chrom ),]
+    
+Stemcells_CD62Lneg_with_drug_tmp = Stemcells_CD62Lneg_with_drug[subjectHits(findOverlaps(roi, Stemcells_CD62Lneg_with_drug)),]
+Stemcells_CD62Lneg_no_drug_tmp = Stemcells_CD62Lneg_no_drug[subjectHits(findOverlaps(roi, Stemcells_CD62Lneg_no_drug)),]
+Stemcells_CD62Lpos_with_drug_tmp = Stemcells_CD62Lpos_with_drug[subjectHits(findOverlaps(roi, Stemcells_CD62Lpos_with_drug)),]
+Stemcells_CD62Lpos_no_drug_tmp = Stemcells_CD62Lpos_no_drug[subjectHits(findOverlaps(roi, Stemcells_CD62Lpos_no_drug)),]
+Mouse_62neg_TG_tmp = Mouse_62neg_TG[subjectHits(findOverlaps(roi, Mouse_62neg_TG)),]
+Mouse_62neg_WT_tmp = Mouse_62neg_WT[subjectHits(findOverlaps(roi, Mouse_62neg_WT)),]
+Mouse_62hi_TG_tmp = Mouse_62hi_TG[subjectHits(findOverlaps(roi, Mouse_62hi_TG)),]
+Mouse_62hi_WT_tmp = Mouse_62hi_WT[subjectHits(findOverlaps(roi, Mouse_62hi_WT)),]
+
+max1 = round(max(c(Stemcells_CD62Lneg_with_drug_tmp$score, Stemcells_CD62Lneg_no_drug_tmp$score,Stemcells_CD62Lpos_with_drug_tmp$score, Stemcells_CD62Lpos_no_drug_tmp$score)),3)  + 0.2
+max2 = round(max(c(Mouse_62neg_TG_tmp$score, Mouse_62neg_WT_tmp$score, Mouse_62hi_TG_tmp$score, Mouse_62hi_WT_tmp$score)),3)  + 0.2
+
+params_1 = pgParams(chrom = chrom, chromstart = chromstart, chromend = chromend, assembly = "mm10",  x = 1, width = 5, default.units = "inches", range = c(0,max1))
+params_2 = pgParams(chrom = chrom, chromstart = chromstart, chromend = chromend, assembly = "mm10",  x = 1, width = 5, default.units = "inches", range = c(0,max2))
+pdf(file.path(maindir, "Output", "Coverage_plots", paste0(region, "_Tracks.pdf")), height = 12, width = 12)
+pageCreate(width = 7, height = 12, default.units = "inches", showGuides = T)
+plotSignal(Stemcells_CD62Lneg_with_drug_tmp,
+           params = params_1,
+           y = 1, 
+           height = 0.6, 
+           label = "Stemcells_CD62Lneg_with_drug", 
+           fill = "deepskyblue1" ,
+           linecolor = "deepskyblue1",
+           default.units = "inches", 
+           scale = T)
+plotSignal(Stemcells_CD62Lneg_no_drug_tmp,
+           params = params_1,
+           y = 2, 
+           height = 0.6, 
+           label = "Stemcells_CD62Lneg_no_drug", 
+           linecolor = "deepskyblue4" ,
+           fill = "deepskyblue4",
+           default.units = "inches", 
+           scale = T)
+plotSignal(Stemcells_CD62Lpos_with_drug_tmp,
+           params = params_1,
+           y = 3, 
+           height = 0.6, 
+           label = "Stemcells_CD62Lpos_with_drug", 
+           fill = "darkolivegreen1" ,
+           linecolor = "darkolivegreen1",
+           default.units = "inches", 
+           scale = T)
+plotSignal(Stemcells_CD62Lpos_no_drug_tmp,
+           params = params_1,
+           y = 4, 
+           height = 0.6, 
+           label = "Stemcells_CD62Lpos_no_drug", 
+           linecolor = "darkolivegreen4" ,
+           fill = "darkolivegreen4",
+           default.units = "inches", 
+           scale = T)
+plotSignal(Mouse_62neg_TG_tmp,
+           params = params_2,
+           y = 5, 
+           height = 0.6, 
+           label = "Mouse_62neg_TG", 
+           fill = "deepskyblue1" ,
+           linecolor = "deepskyblue1",
+           default.units = "inches",
+           scale = T)
+plotSignal(Mouse_62neg_WT_tmp,
+           params = params_2,
+           y = 6, 
+           height = 0.6, 
+           label = "Mouse_62neg_WT", 
+           linecolor = "deepskyblue4" ,
+           fill = "deepskyblue4",
+           default.units = "inches", 
+           scale = T)
+plotSignal(Mouse_62hi_TG_tmp,
+           params = params_2,
+           y = 7, 
+           height = 0.6, 
+           label = "Mouse_62hi_TG", 
+           fill = "darkolivegreen1" ,
+           linecolor = "darkolivegreen1",
+           default.units = "inches", 
+           scale = T)
+plotSignal(Mouse_62hi_WT_tmp,
+           params = params_2,
+           y = 8, 
+           height = 0.6, 
+           label = "Mouse_62hi_WT", 
+           linecolor = "darkolivegreen4" ,
+           fill = "darkolivegreen4",
+           default.units = "inches", 
+           scale = T)
+
+## Plot genes
+genes_gm <- plotGenes(params = params_1, stroke = 1, fontsize = 12,
+                         strandLabels = FALSE,
+                         y = 9, height = 0.4, fill = "black", fontcolor = "black")
+annoGenomeLabel(plot = genes_gm,params = params_1, 
+                   scale = "Kb", fontsize = 12, digits = 0,
+                   y = 9.5)
+pageGuideHide()
+dev.off()
+
+}
+```
+
+```{r Get top 1K bins per sample to then use them to make DA and call motifs}
+
+# feature_Granges = define_feature(ref = "mm10", bin_width = 1000)
+# FeatureMatrix_1K = wrapper_Signac_FeatureMatrix(file.path(maindir,"Input", "Fragments_bin"), which = feature_Granges, ref = "mm10", process_n = 30000)
+# qs::qsave(FeatureMatrix_1K, file.path(maindir, "Input", "FeatureMatrix_1K.qs"))
+
+FeatureMatrix_1K = qs::qread(file.path(maindir, "Input", "FeatureMatrix_1K.qs"))
+datamatrix = FeatureMatrix_1K$datamatrix
+annot_raw = FeatureMatrix_1K$annot_raw
+
+annot_raw$sample_id = sub(".fragments","", annot_raw$sample_id)
+annot_raw$cell_id = sub(".fragments","", annot_raw$cell_id)
+
+colnames(datamatrix) = annot_raw$cell_id
+rownames(annot_raw) = annot_raw$cell_id
+
+# Load annot made previously 
+col_data = read.csv(file.path(maindir, "Output","Objects","coldata_scExp50K_all_samples.csv"), row.names = "X")
+
+############################################ For stem cells ############################################
+col_data_stemcells = col_data %>% dplyr::filter(group_id == "stem_cells")
+idx <- match(col_data_stemcells$cell_id, colnames(datamatrix))
+datamatrix_stemcells <- datamatrix[,idx]
+
+ scExp_1K = create_scExp(datamatrix_stemcells, col_data_stemcells,
+                         remove_zero_cells = TRUE,
+                         remove_zero_features = TRUE)
+  
+   plot_distribution_scExp(scExp_1K, log10 = T) 
+ 
+  scExp_1K = normalize_scExp(scExp_1K, type = "CPM")
+
+
+ #### Get rownames of top 5000 expressed bins by cluster in 1K (normalize by CPM)
+  cluster = unique(col_data_stemcells$sample_id)[1]
+  top_features = c()
+  for (cluster in unique(col_data_stemcells$sample_id)){
+    cell_vec = col_data_stemcells$cell_id[which(col_data_stemcells$sample_id == cluster)]
+    tmp.mat = normcounts(scExp_1K)[,cell_vec]
+    tmp.features = rownames(tmp.mat)[order(rowSums2(tmp.mat), decreasing = T)[1:5000]]
+    top_features = c(top_features, tmp.features)
+  }
+  top_features = unique(top_features)
+  idx <- match(top_features, rownames(datamatrix))
+
+# Subset safely, preserving sparsity
+datamatrix_stemcells <- datamatrix_stemcells[idx,]
+
+  #create sc exp object with the selected bins and do Differential analysis
+   scExp_1K = create_scExp(datamatrix_stemcells, col_data_stemcells,
+                         remove_zero_cells = TRUE,
+                         remove_zero_features = TRUE)
+   
+   
+   scExp_1K = normalize_scExp(scExp_1K, type = "CPM")
+   
+   scExp_1K = feature_annotation_scExp(scExp_1K, ref = "mm10")
+   
+    scExp_1K = find_top_features(
+        scExp_1K,
+        n = nrow(scExp_1K),
+        keep_others = FALSE)
+    
+     # scExp_1K = normalize_scExp(scExp_1K, type = "TFIDF")
+   
+  scExp_1K = reduce_dims_scExp(
+        scExp_1K, n = 20,
+        dimension_reductions = c("PCA"),
+        batch_correction = FALSE, batch_list = NULL,  
+        remove_PC = NULL,
+        verbose = FALSE)
+    
+  plot_correlation_PCA_scExp(
+        scExp_1K,
+        correlation_var = "total_counts",
+        color_by = NULL,
+        topPC = 20)
+  
+  scExp_1K = reduce_dims_scExp(
+        scExp_1K, n = 20,
+        dimension_reductions = c("PCA","UMAP"), #, "TSNE"),
+        batch_correction = FALSE, batch_list = NULL,  
+        remove_PC = NULL,
+        verbose = FALSE)
+    
+  plot_correlation_PCA_scExp(
+        scExp_1K,
+        correlation_var = "total_counts",
+        color_by = NULL,
+        topPC = 20)
+  
+   scExp_1K = ChromSCape::find_clusters_louvain_scExp(scExp_1K, resolution = 1)
+  
+  plot_reduced_dim_scExp(scExp_1K, color_by = "cell_cluster", reduced_dim = "UMAP", transparency = 0.5, size = 1, downsample = dim(scExp_1K)[2], min_quantile = 0, max_quantile = 1, annotate_clusters = F) +
+     plot_reduced_dim_scExp(scExp_1K, color_by = "sample_id", reduced_dim = "UMAP", transparency = 0.5, size = 1, downsample = dim(scExp_1K)[2], min_quantile = 0, max_quantile = 1, annotate_clusters = F)
+    plot_reduced_dim_scExp(scExp_1K, color_by = "Gm10800", reduced_dim = "UMAP", transparency = 0.5, size = 1, downsample = dim(scExp_1K)[2], min_quantile = 0, max_quantile = 1, annotate_clusters = F)
+    
+    
+     df_plot_1K = cbind(as.data.frame(colData(scExp_1K)),as.data.frame(reducedDim(scExp_1K, "UMAP")))
+  df_plot_1K = df_plot_1K[sample(1:nrow(df_plot_1K)), ]
+  
+    pdf(file.path(maindir, "Output", "UMAP_filtered_cells_Peaks_1Kbins_stem_cells.pdf"), width = 9)
+   
+  df_plot_1K %>% ggplot(aes(x = Component_1, y = Component_2, fill = cell_cluster)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_manual(values = palette_color) + theme_void() +
+   df_plot_1K %>% ggplot(aes(x = Component_1, y = Component_2, fill = log10(total_counts))) + geom_point(shape = 21, color = "grey70", size = 3) + theme_void() + scale_fill_viridis(option = "D") +
+  df_plot_1K %>% ggplot(aes(x = Component_1, y = Component_2, fill = sample_id)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_brewer(palette = "Set3") + theme_void() + 
+      df_plot_1K %>% ggplot(aes(x = Component_1, y = Component_2, fill = group_id)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_brewer(palette = "Set3") + theme_void()
+  
+  dev.off()
+  
+  #### Chromvar Analysis ###
+
+genome_used <- BSgenome.Mmusculus.UCSC.mm10
+
+#Use scExp_1K already computed 
+sce <- scExp_1K  
+
+# parse rownames: e.g. "chr2_98667001_98668000"
+peak_strings <- rownames(sce)
+
+peak_gr <- do.call("c", lapply(peak_strings, function(x) {
+  parts <- strsplit(x, "_")[[1]]
+  GRanges(
+    seqnames = parts[1],
+    ranges = IRanges(
+      start = as.integer(parts[2]),
+      end   = as.integer(parts[3])
+    )
+  )
+}))
+
+names(peak_gr) <- peak_strings
+
+rowRanges(sce) <- peak_gr
+
+# add GC content / peak width
+sce <- addGCBias(sce, genome = genome_used)
+
+# optional: filter out very low-signal peaks
+sce <- filterPeaks(sce, min_fragments = 5)  # adjust threshold if needed
+
+# get JASPAR TF motifs
+
+                      ### Mouse motifs  ###
+
+opts <- list(species = 10090, all_versions = FALSE) # mouse
+
+motifs <- TFBSTools::getMatrixSet(JASPAR2020, opts)
+
+# match motifs to peaks
+# motifs <- getJasparMotifs(species = "Mus musculus")
+motif_ix <- matchMotifs(
+  motifs,
+  rowRanges(sce),
+  genome = genome_used
+)
+
+set.seed(1)
+
+background_peaks <- getBackgroundPeaks(sce)
+
+dev <- computeDeviations(
+  object = sce,
+  annotations = motif_ix,
+  background_peaks = background_peaks
+)
+rownames(dev) <- paste(rownames(dev), rowData(dev)$name, sep = "_")
+# per-cell motif deviation matrices:
+motif_dev_raw <- deviations(dev)        # motif × cell, raw deviations
+motif_dev_z   <- deviationScores(dev)   # motif × cell, z-scores (usually used)
+
+diff_acc <- differentialDeviations(dev, "sample_id")
+
+head(diff_acc[order(diff_acc$p_value_adjusted),], 10)
+interesting_Tfs = rownames(diff_acc)[which(diff_acc$p_value_adjusted < 0.10)]
+
+      #Make plots for interesting TFs 
+motif_dev_z_tmp = motif_dev_z[interesting_Tfs,]
+         df_plot_1K = cbind(as.data.frame(colData(scExp_1K)),as.data.frame(reducedDim(scExp_1K, "UMAP")), as.data.frame(t(motif_dev_z_tmp)))
+  df_plot_1K = df_plot_1K[sample(1:nrow(df_plot_1K)), ]
+    # 3) reshape to long format for all TFs
+df_long <- df_plot_1K %>%
+  pivot_longer(
+    cols = all_of(interesting_Tfs),
+    names_to = "TF",
+    values_to = "deviation"
+  )
+
+# comparisons (you already have this)
+my_comparisons <- list(
+  c("CD62L-_stem_cells_no_drug_tagged",  "CD62L-_stem_cells_with_drug_tagged"),
+  c("CD62L+_stem_cells_no_drug_tagged",  "CD62L+_stem_cells_with_drug_tagged")
+)
+
+# 4) plot: one boxplot per TF (facet)
+p <- df_long %>%
+  ggplot(aes(x = sample_id, y = deviation, color = sample_id)) +
+  geom_boxplot(outlier.shape = NA) +
+  theme_bw() +
+  stat_compare_means(comparisons = my_comparisons) +
+  facet_wrap(~ TF, scales = "free_y") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+ pdf(file.path(maindir, "Output", "Boxplot_TFs_Deviation_MouseMotifs_Peaks_1Kbins_stem_cells.pdf"), width = 15, height = 15)
+p
+  
+dev.off()
+
+ ## Pathway enrichment on top TFs from Chromvar ###
+
+interesting_motifs <- interesting_Tfs 
+
+tf_symbols <- interesting_motifs |>
+  sub("^MA\\d+\\.\\d+_", "", x = _) |>   
+  strsplit("::") |>                      
+  unlist() |>
+  unique()
+
+tf_symbols
+library(enrichR)
+
+dbs <- c(
+  "GO_Biological_Process_2023"
+)
+
+enr <- enrichr(tf_symbols, dbs)
+GO_enr <- enr$GO_Biological_Process_2023
+
+write.csv(GO_enr, file.path(maindir, "Output","Objects", "GO_Enrichment_TFs_Deviation_MouseMotifs_Peaks_1Kbins_stem_cells.csv"))
+
+
+                      ### Human motifs  ###
+
+
+opts <- list(species = 9606, all_versions = FALSE)   # human
+
+motifs <- TFBSTools::getMatrixSet(JASPAR2020, opts)
+
+# match motifs to peaks
+motif_ix <- matchMotifs(
+  motifs,
+  rowRanges(sce),
+  genome = genome_used
+)
+
+set.seed(1)
+
+background_peaks <- getBackgroundPeaks(sce)
+
+dev <- computeDeviations(
+  object = sce,
+  annotations = motif_ix,
+  background_peaks = background_peaks
+)
+rownames(dev) <- paste(rownames(dev), rowData(dev)$name, sep = "_")
+# per-cell motif deviation matrices:
+motif_dev_raw <- deviations(dev)        # motif × cell, raw deviations
+motif_dev_z   <- deviationScores(dev)   # motif × cell, z-scores (usually used)
+
+diff_acc <- differentialDeviations(dev, "sample_id")
+
+head(diff_acc[order(diff_acc$p_value_adjusted),], 10)
+interesting_Tfs = rownames(diff_acc)[which(diff_acc$p_value_adjusted < 0.10)]
+
+      #Make plots for interesting TFs 
+motif_dev_z_tmp = motif_dev_z[interesting_Tfs,]
+         df_plot_1K = cbind(as.data.frame(colData(scExp_1K)),as.data.frame(reducedDim(scExp_1K, "UMAP")), as.data.frame(t(motif_dev_z_tmp)))
+  df_plot_1K = df_plot_1K[sample(1:nrow(df_plot_1K)), ]
+    # 3) reshape to long format for all TFs
+df_long <- df_plot_1K %>%
+  pivot_longer(
+    cols = all_of(interesting_Tfs),
+    names_to = "TF",
+    values_to = "deviation"
+  )
+
+# comparisons
+my_comparisons <- list(
+  c("CD62L-_stem_cells_no_drug_tagged",  "CD62L-_stem_cells_with_drug_tagged"),
+  c("CD62L+_stem_cells_no_drug_tagged",  "CD62L+_stem_cells_with_drug_tagged")
+)
+
+# 4) plot: one boxplot per TF (facet)
+p <- df_long %>%
+  ggplot(aes(x = sample_id, y = deviation, color = sample_id)) +
+  geom_boxplot(outlier.shape = NA) +
+  theme_bw() +
+  stat_compare_means(comparisons = my_comparisons) +
+  facet_wrap(~ TF, scales = "free_y") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+ pdf(file.path(maindir, "Output", "Boxplot_TFs_Deviation_HumanMotifs_Peaks_1Kbins_stem_cells.pdf"), width = 30, height = 30)
+p
+  
+dev.off()
+
+ ## Pathway enrichment on top TFs from Chromvar ###
+
+interesting_motifs <- interesting_Tfs 
+
+tf_symbols <- interesting_motifs |>
+  sub("^MA\\d+\\.\\d+_", "", x = _) |>   
+  strsplit("::") |>                      
+  unlist() |>
+  unique()
+
+tf_symbols
+library(enrichR)
+
+dbs <- c(
+  "GO_Biological_Process_2023"
+)
+
+enr <- enrichr(tf_symbols, dbs)
+GO_enr <- enr$GO_Biological_Process_2023
+
+write.csv(GO_enr, file.path(maindir, "Output","Objects", "GO_Enrichment_TFs_Deviation_HumanMotifs_Peaks_1Kbins_stem_cells.csv"))
+
+   
+   ### differential analysis ###
+  
+  ## CD62L-_stem_cells_Drug_vs_No_Drug 
+   scExp_1K_da = differential_analysis_scExp(scExp_1K, de_type = "custom", by = c("sample_id", "sample_id"),group = data.frame(group = c("CD62L-_stem_cells_with_drug_tagged")), ref = data.frame(ref = c("CD62L-_stem_cells_no_drug_tagged")), prioritize_genes = F, method = "neg.binomial")
+    DA = as.data.frame(rowData(scExp_1K_da))
+    DA = DA %>% mutate(status = case_when(qval.group > 0.05 ~ "Not Sig",
+                                                    abs(logFC.group) < 0.5 ~ "Not Sig",
+                                        qval.group < 0.05 & logFC.group < -0.5 ~ "Down",
+                                        qval.group < 0.05 & logFC.group > 0.5 ~ "Up"))
+    pdf(file.path(maindir, "Output", "Volcano_CD62L-_stem_cells_Drug_vs_No_Drug.pdf"), width = 9)
+    DA %>%
+  ggplot(aes(x = logFC.group, y = -log10(qval.group), fill = status)) + 
+  geom_point(size = 4, alpha = 0.4, shape = 21, color = "black") +   
+  geom_hline(yintercept = -log10(0.05), linetype="dashed") + 
+  geom_vline(xintercept = 0.5, linetype="dashed") +
+   geom_vline(xintercept = -0.5, linetype="dashed") +
+  theme_classic() +
+  scale_fill_manual(values = c("lightskyblue", "grey50", "tomato")) +
+  ggrepel::geom_text_repel(data = dplyr::filter(DA, -log10(qval.group) > 1.30103), aes(label = Gene), max.overlaps = 20, color = "black", size = 5) + 
+    ggtitle("Volcano Plot - CD62L-_stem_cells - Drug vs No Drug")
+    dev.off()
+    
+    write.csv(DA, file.path(maindir, "Output","Objects","DA_CD62L-_stem_cells_Drug_vs_No_Drug.csv"), row.names = F)
+    
+     ## CD62L+_stem_cells_Drug_vs_No_Drug 
+   scExp_1K_da = differential_analysis_scExp(scExp_1K, de_type = "custom", by = c("sample_id", "sample_id"),group = data.frame(group = c("CD62L+_stem_cells_with_drug_tagged")), ref = data.frame(ref = c("CD62L+_stem_cells_no_drug_tagged")), prioritize_genes = F, method = "neg.binomial")
+    DA = as.data.frame(rowData(scExp_1K_da))
+    DA = DA %>% mutate(status = case_when(qval.group > 0.05 ~ "Not Sig",
+                                                    abs(logFC.group) < 0.5 ~ "Not Sig",
+                                        qval.group < 0.05 & logFC.group < -0.5 ~ "Down",
+                                        qval.group < 0.05 & logFC.group > 0.5 ~ "Up"))
+    pdf(file.path(maindir, "Output", "Volcano_CD62L+_stem_cells_Drug_vs_No_Drug.pdf"), width = 9)
+    DA %>%
+  ggplot(aes(x = logFC.group, y = -log10(qval.group), fill = status)) + 
+  geom_point(size = 4, alpha = 0.4, shape = 21, color = "black") +   
+  geom_hline(yintercept = -log10(0.05), linetype="dashed") + 
+  geom_vline(xintercept = 0.5, linetype="dashed") +
+   geom_vline(xintercept = -0.5, linetype="dashed") +
+  theme_classic() +
+  scale_fill_manual(values = c("lightskyblue", "grey50", "tomato")) +
+  ggrepel::geom_text_repel(data = dplyr::filter(DA, -log10(qval.group) > 1.30103), aes(label = Gene), max.overlaps = 20, color = "black", size = 5) + 
+    ggtitle("Volcano Plot - CD62L+_stem_cells - Drug vs No Drug")
+    dev.off()
+    
+    write.csv(DA, file.path(maindir, "Output","Objects","DA_CD62L+_stem_cells_Drug_vs_No_Drug.csv"), row.names = F)
+    
+
+############################################ For Mouse ############################################
+col_data_mouse = col_data %>% dplyr::filter(group_id == "mouse")
+idx <- match(col_data_mouse$cell_id, colnames(datamatrix))
+datamatrix_mouse <- datamatrix[,idx]
+
+ scExp_1K = create_scExp(datamatrix_mouse, col_data_mouse,
+                         remove_zero_cells = TRUE,
+                         remove_zero_features = TRUE)
+  
+   plot_distribution_scExp(scExp_1K, log10 = T) 
+ 
+  scExp_1K = normalize_scExp(scExp_1K, type = "CPM")
+
+
+ #### Get rownames of top 5000 expressed bins by cluster in 1K (normalize by CPM)
+  cluster = unique(col_data_mouse$sample_id)[1]
+  top_features = c()
+  for (cluster in unique(col_data_mouse$sample_id)){
+    cell_vec = col_data_mouse$cell_id[which(col_data_mouse$sample_id == cluster)]
+    tmp.mat = normcounts(scExp_1K)[,cell_vec]
+    tmp.features = rownames(tmp.mat)[order(rowSums2(tmp.mat), decreasing = T)[1:5000]]
+    top_features = c(top_features, tmp.features)
+  }
+  top_features = unique(top_features)
+  idx <- match(top_features, rownames(datamatrix))
+
+# Subset safely, preserving sparsity
+datamatrix_mouse <- datamatrix_mouse[idx,]
+
+  #create sc exp object with the selected bins and do Differential analysis
+   scExp_1K = create_scExp(datamatrix_mouse, col_data_mouse,
+                         remove_zero_cells = TRUE,
+                         remove_zero_features = TRUE)
+   
+   
+   scExp_1K = normalize_scExp(scExp_1K, type = "CPM")
+   
+   scExp_1K = feature_annotation_scExp(scExp_1K, ref = "mm10")
+   
+    scExp_1K = find_top_features(
+        scExp_1K,
+        n = nrow(scExp_1K),
+        keep_others = FALSE)
+    
+     # scExp_1K = normalize_scExp(scExp_1K, type = "TFIDF")
+   
+  scExp_1K = reduce_dims_scExp(
+        scExp_1K, n = 20,
+        dimension_reductions = c("PCA"),
+        batch_correction = FALSE, batch_list = NULL,  
+        remove_PC = NULL,
+        verbose = FALSE)
+    
+  plot_correlation_PCA_scExp(
+        scExp_1K,
+        correlation_var = "total_counts",
+        color_by = NULL,
+        topPC = 20)
+  
+  scExp_1K = reduce_dims_scExp(
+        scExp_1K, n = 20,
+        dimension_reductions = c("PCA","UMAP"), #, "TSNE"),
+        batch_correction = FALSE, batch_list = NULL,  
+        remove_PC = NULL,
+        verbose = FALSE)
+    
+  plot_correlation_PCA_scExp(
+        scExp_1K,
+        correlation_var = "total_counts",
+        color_by = NULL,
+        topPC = 20)
+  
+   scExp_1K = ChromSCape::find_clusters_louvain_scExp(scExp_1K, resolution = 1)
+  
+  plot_reduced_dim_scExp(scExp_1K, color_by = "cell_cluster", reduced_dim = "UMAP", transparency = 0.5, size = 1, downsample = dim(scExp_1K)[2], min_quantile = 0, max_quantile = 1, annotate_clusters = F) +
+     plot_reduced_dim_scExp(scExp_1K, color_by = "sample_id", reduced_dim = "UMAP", transparency = 0.5, size = 1, downsample = dim(scExp_1K)[2], min_quantile = 0, max_quantile = 1, annotate_clusters = F)
+    
+     df_plot_1K = cbind(as.data.frame(colData(scExp_1K)),as.data.frame(reducedDim(scExp_1K, "UMAP")))
+  df_plot_1K = df_plot_1K[sample(1:nrow(df_plot_1K)), ]
+  
+    pdf(file.path(maindir, "Output", "UMAP_filtered_cells_Peaks_1Kbins_mouse.pdf"), width = 9)
+   
+  df_plot_1K %>% ggplot(aes(x = Component_1, y = Component_2, fill = cell_cluster)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_manual(values = palette_color) + theme_void() +
+   df_plot_1K %>% ggplot(aes(x = Component_1, y = Component_2, fill = log10(total_counts))) + geom_point(shape = 21, color = "grey70", size = 3) + theme_void() + scale_fill_viridis(option = "D") +
+  df_plot_1K %>% ggplot(aes(x = Component_1, y = Component_2, fill = sample_id)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_brewer(palette = "Set3") + theme_void() + 
+      df_plot_1K %>% ggplot(aes(x = Component_1, y = Component_2, fill = group_id)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_brewer(palette = "Set3") + theme_void()
+  
+  dev.off()
+  
+    #### Chromvar Analysis ###
+
+genome_used <- BSgenome.Mmusculus.UCSC.mm10
+
+#Use scExp_1K already computed 
+sce <- scExp_1K  
+
+# parse rownames: e.g. "chr2_98667001_98668000"
+peak_strings <- rownames(sce)
+
+peak_gr <- do.call("c", lapply(peak_strings, function(x) {
+  parts <- strsplit(x, "_")[[1]]
+  GRanges(
+    seqnames = parts[1],
+    ranges = IRanges(
+      start = as.integer(parts[2]),
+      end   = as.integer(parts[3])
+    )
+  )
+}))
+
+names(peak_gr) <- peak_strings
+
+rowRanges(sce) <- peak_gr
+
+# add GC content / peak width
+sce <- addGCBias(sce, genome = genome_used)
+
+# optional: filter out very low-signal peaks
+sce <- filterPeaks(sce, min_fragments = 5)  # adjust threshold if needed
+
+# get JASPAR TF motifs
+
+                      ### Mouse motifs  ###
+
+opts <- list(species = 10090, all_versions = FALSE) # mouse
+
+motifs <- TFBSTools::getMatrixSet(JASPAR2020, opts)
+
+# match motifs to peaks
+# motifs <- getJasparMotifs(species = "Mus musculus")
+motif_ix <- matchMotifs(
+  motifs,
+  rowRanges(sce),
+  genome = genome_used
+)
+
+set.seed(1)
+
+background_peaks <- getBackgroundPeaks(sce)
+
+dev <- computeDeviations(
+  object = sce,
+  annotations = motif_ix,
+  background_peaks = background_peaks
+)
+rownames(dev) <- paste(rownames(dev), rowData(dev)$name, sep = "_")
+# per-cell motif deviation matrices:
+motif_dev_raw <- deviations(dev)        # motif × cell, raw deviations
+motif_dev_z   <- deviationScores(dev)   # motif × cell, z-scores (usually used)
+
+diff_acc <- differentialDeviations(dev, "sample_id")
+
+head(diff_acc[order(diff_acc$p_value_adjusted),], 10)
+interesting_Tfs = rownames(diff_acc)[which(diff_acc$p_value_adjusted < 0.20)]
+
+      #Make plots for interesting TFs 
+motif_dev_z_tmp = motif_dev_z[interesting_Tfs,]
+         df_plot_1K = cbind(as.data.frame(colData(scExp_1K)),as.data.frame(reducedDim(scExp_1K, "UMAP")), as.data.frame(t(motif_dev_z_tmp)))
+  df_plot_1K = df_plot_1K[sample(1:nrow(df_plot_1K)), ]
+    # 3) reshape to long format for all TFs
+df_long <- df_plot_1K %>%
+  pivot_longer(
+    cols = all_of(interesting_Tfs),
+    names_to = "TF",
+    values_to = "deviation"
+  )
+
+
+my_comparisons <- list(
+  c("m61_m66_WT_62neg_tagged",  "m64_m68_Tg_62neg_tagged"),
+  c("m61_m66_WT_62hi_tagged",  "m64_m68_Tg_62hi_tagged")
+)
+
+# 4) plot: one boxplot per TF (facet)
+p <- df_long %>% mutate(sample_id = factor(sample_id, levels = c("m61_m66_WT_62neg_tagged",  "m64_m68_Tg_62neg_tagged", "m61_m66_WT_62hi_tagged", "m64_m68_Tg_62hi_tagged"))) %>%
+  ggplot(aes(x = sample_id, y = deviation, color = sample_id)) +
+  geom_boxplot(outlier.shape = NA) +
+  theme_bw() +
+  stat_compare_means(comparisons = my_comparisons) +
+  facet_wrap(~ TF, scales = "free_y") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+ pdf(file.path(maindir, "Output", "Boxplot_TFs_Deviation_MouseMotifs_Peaks_1Kbins_Mouse.pdf"), width = 15, height = 15)
+p
+  
+dev.off()
+
+ ## Pathway enrichment on top TFs from Chromvar ###
+
+interesting_motifs <- interesting_Tfs 
+
+tf_symbols <- interesting_motifs |>
+  sub("^MA\\d+\\.\\d+_", "", x = _) |>   
+  strsplit("::") |>                      
+  unlist() |>
+  unique()
+
+tf_symbols
+library(enrichR)
+
+dbs <- c(
+  "GO_Biological_Process_2023"
+)
+
+enr <- enrichr(tf_symbols, dbs)
+GO_enr <- enr$GO_Biological_Process_2023
+
+write.csv(GO_enr, file.path(maindir, "Output","Objects", "GO_Enrichment_TFs_Deviation_MouseMotifs_Peaks_1Kbins_mouse.csv"))
+
+                      ### Human motifs  ###
+
+
+opts <- list(species = 9606, all_versions = FALSE)   # human
+
+motifs <- TFBSTools::getMatrixSet(JASPAR2020, opts)
+
+# match motifs to peaks
+motif_ix <- matchMotifs(
+  motifs,
+  rowRanges(sce),
+  genome = genome_used
+)
+
+set.seed(1)
+
+background_peaks <- getBackgroundPeaks(sce)
+
+dev <- computeDeviations(
+  object = sce,
+  annotations = motif_ix,
+  background_peaks = background_peaks
+)
+rownames(dev) <- paste(rownames(dev), rowData(dev)$name, sep = "_")
+# per-cell motif deviation matrices:
+motif_dev_raw <- deviations(dev)        # motif × cell, raw deviations
+motif_dev_z   <- deviationScores(dev)   # motif × cell, z-scores (usually used)
+
+diff_acc <- differentialDeviations(dev, "sample_id")
+
+head(diff_acc[order(diff_acc$p_value_adjusted),], 10)
+interesting_Tfs = rownames(diff_acc)[which(diff_acc$p_value_adjusted < 0.10)]
+
+      #Make plots for interesting TFs 
+motif_dev_z_tmp = motif_dev_z[interesting_Tfs,]
+         df_plot_1K = cbind(as.data.frame(colData(scExp_1K)),as.data.frame(reducedDim(scExp_1K, "UMAP")), as.data.frame(t(motif_dev_z_tmp)))
+  df_plot_1K = df_plot_1K[sample(1:nrow(df_plot_1K)), ]
+    # 3) reshape to long format for all TFs
+df_long <- df_plot_1K %>%
+  pivot_longer(
+    cols = all_of(interesting_Tfs),
+    names_to = "TF",
+    values_to = "deviation"
+  )
+
+my_comparisons <- list(
+  c("m61_m66_WT_62neg_tagged",  "m64_m68_Tg_62neg_tagged"),
+  c("m61_m66_WT_62hi_tagged",  "m64_m68_Tg_62hi_tagged")
+)
+
+# 4) plot: one boxplot per TF (facet)
+p <- df_long %>% mutate(sample_id = factor(sample_id, levels = c("m61_m66_WT_62neg_tagged",  "m64_m68_Tg_62neg_tagged", "m61_m66_WT_62hi_tagged", "m64_m68_Tg_62hi_tagged"))) %>%
+  ggplot(aes(x = sample_id, y = deviation, color = sample_id)) +
+  geom_boxplot(outlier.shape = NA) +
+  theme_bw() +
+  stat_compare_means(comparisons = my_comparisons) +
+  facet_wrap(~ TF, scales = "free_y") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+ pdf(file.path(maindir, "Output", "Boxplot_TFs_Deviation_HumanMotifs_Peaks_1Kbins_Mouse.pdf"), width = 30, height = 30)
+p
+  
+dev.off()
+
+ ## Pathway enrichment on top TFs from Chromvar ###
+
+interesting_motifs <- interesting_Tfs 
+
+tf_symbols <- interesting_motifs |>
+  sub("^MA\\d+\\.\\d+_", "", x = _) |>   
+  strsplit("::") |>                      
+  unlist() |>
+  unique()
+
+tf_symbols
+library(enrichR)
+
+dbs <- c(
+  "GO_Biological_Process_2023"
+)
+
+enr <- enrichr(tf_symbols, dbs)
+GO_enr <- enr$GO_Biological_Process_2023
+
+write.csv(GO_enr, file.path(maindir, "Output","Objects", "GO_Enrichment_TFs_Deviation_HumanMotifs_Peaks_1Kbins_mouse.csv"))
+   
+   ### differential analysis ###
+  
+  ## Mouse_62neg_Tg_vs_WT
+   scExp_1K_da = differential_analysis_scExp(scExp_1K, de_type = "custom", by = c("sample_id", "sample_id"),group = data.frame(group = c("m64_m68_Tg_62neg_tagged")), ref = data.frame(ref = c("m61_m66_WT_62neg_tagged")), prioritize_genes = F, method = "neg.binomial")
+    DA = as.data.frame(rowData(scExp_1K_da))
+    DA = DA %>% mutate(status = case_when(qval.group > 0.05 ~ "Not Sig",
+                                                    abs(logFC.group) < 0.5 ~ "Not Sig",
+                                        qval.group < 0.05 & logFC.group < -0.5 ~ "Down",
+                                        qval.group < 0.05 & logFC.group > 0.5 ~ "Up"))
+    pdf(file.path(maindir, "Output", "Volcano_Mouse_62neg_Tg_vs_WT.pdf"), width = 9)
+    DA %>%
+  ggplot(aes(x = logFC.group, y = -log10(qval.group), fill = status)) + 
+  geom_point(size = 4, alpha = 0.4, shape = 21, color = "black") +   
+  geom_hline(yintercept = -log10(0.05), linetype="dashed") + 
+  geom_vline(xintercept = 0.5, linetype="dashed") +
+   geom_vline(xintercept = -0.5, linetype="dashed") +
+  theme_classic() +
+  scale_fill_manual(values = c("lightskyblue", "grey50", "tomato")) +
+  ggrepel::geom_text_repel(data = dplyr::filter(DA, -log10(qval.group) > 1.30103), aes(label = Gene), max.overlaps = 20, color = "black", size = 5) + 
+    ggtitle("Volcano Plot - Mouse 62 neg - Tg vs WT")
+    dev.off()
+    
+    write.csv(DA, file.path(maindir, "Output","Objects","DA_Mouse_62neg_Tg_vs_WT.csv"), row.names = F)
+    
+    ## Mouse_62hi_Tg_vs_WT
+     scExp_1K_da = differential_analysis_scExp(scExp_1K, de_type = "custom", by = c("sample_id", "sample_id"),group = data.frame(group = c("m64_m68_Tg_62hi_tagged")), ref = data.frame(ref = c("m61_m66_WT_62hi_tagged")), prioritize_genes = F, method = "neg.binomial")
+      DA = as.data.frame(rowData(scExp_1K_da))
+      DA = DA %>% mutate(status = case_when(qval.group > 0.05 ~ "Not Sig",
+                                                      abs(logFC.group) < 0.5 ~ "Not Sig",
+                                          qval.group < 0.05 & logFC.group < -0.5 ~ "Down",
+                                          qval.group < 0.05 & logFC.group > 0.5 ~ "Up"))
+      pdf(file.path(maindir, "Output", "Volcano_Mouse_62hi_Tg_vs_WT.pdf"), width = 9)
+      DA %>%
+    ggplot(aes(x = logFC.group, y = -log10(qval.group), fill = status)) + 
+    geom_point(size = 4, alpha = 0.4, shape = 21, color = "black") +   
+    geom_hline(yintercept = -log10(0.05), linetype="dashed") + 
+    geom_vline(xintercept = 0.5, linetype="dashed") +
+     geom_vline(xintercept = -0.5, linetype="dashed") +
+    theme_classic() +
+    scale_fill_manual(values = c("lightskyblue", "grey50", "tomato")) +
+    ggrepel::geom_text_repel(data = dplyr::filter(DA, -log10(qval.group) > 1.30103), aes(label = Gene), max.overlaps = 20, color = "black", size = 5) + 
+      ggtitle("Volcano Plot - Mouse 62 high - Tg vs WT")
+      dev.off()
+      
+      write.csv(DA, file.path(maindir, "Output","Objects","DA_Mouse_62high_Tg_vs_WT.csv"), row.names = F)
+    
+
+############################################  TF ANALYSIS ##################
+#     
+#    
+#    
+#    DA = read.csv(file.path(maindir, "Output","Objects","DA_Mouse_62high_Tg_vs_WT.csv"))
+#     DA <- DA %>%
+#   mutate(seqnames = gsub("(chr.*)_(.*)_(.*)", "\\1",ID),
+#          start = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\2",ID)), 
+#          end = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\3",ID)))
+# 
+# #Motif Enrichment 
+# mm.genome = BSgenome.Mmusculus.UCSC.mm10::BSgenome.Mmusculus.UCSC.mm10
+# meme_db = read_meme(file.path(maindir, "Annotations", "HOCOMOCOv11_core_MOUSE_mono_meme_format.meme")) %>% to_df()
+# # meme_db = read_meme(file.path(maindir, "Annotations", "H13CORE_meme_format.meme")) %>% to_df()
+# meme_db = to_list(meme_db)
+# 
+# meme_db_jaspar = list()
+# file = list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))[1]
+# 
+# for (file in list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))){
+#   jaspar_to_add = read_meme(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme", file))
+#   meme_db_jaspar = c(meme_db_jaspar, jaspar_to_add)
+# }
+# meme_db_jaspar = meme_db_jaspar %>%
+#   to_df() %>%
+#   mutate(name = paste0(altname, "_", name)) %>%
+#   to_list()
+#     
+# Motif_diff = DA %>% dplyr::filter(logFC.group < -0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+# Background = DA %>% dplyr::filter(abs(logFC.group) < 0.1) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+# 
+# AME_LP_HS1 = memes::runAme(Motif_diff,control = Background, database = meme_db_jaspar)
+# head(AME_LP_HS1)
+# AME_LP_HS2 = memes::runAme(Motif_diff,control = Background, database = meme_db)
+# head(AME_LP_HS2)
+# 
+#     pdf(file.path(maindir, "Output", "Motif_Enrichment_Mouse_62_high_Tg_vs_WT_Downregulated_peaks.pdf"), width = 9)
+# AME_LP_HS1 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS1, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Mouse 62 high - Tg vs WT \n - Downregulated peaks - Jaspar database")
+# 
+# AME_LP_HS2 = AME_LP_HS2 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id)) 
+# AME_LP_HS2 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS2, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Mouse 62 high - Tg vs WT \n - Downregulated peaks - Hocomoco database")
+#    dev.off()
+#    
+#     write.csv(AME_LP_HS1, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62_high_Tg_vs_WT_Downregulated_peaks_JASPAR.csv"), row.names = F)
+#     write.csv(AME_LP_HS2, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62_high_Tg_vs_WT_Downregulated_peaks_HOCOMOCO.csv"), row.names = F)
+#     
+    
+   ####  Cell Line ###
+      #### CD62L - ###
+      
+   DA = read.csv(file.path(maindir, "Output","Objects","DA_CD62L-_stem_cells_Drug_vs_No_Drug.csv"))
+    DA <- DA %>%
+  mutate(seqnames = gsub("(chr.*)_(.*)_(.*)", "\\1",ID),
+         start = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\2",ID)), 
+         end = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\3",ID)))
+
+#Motif Enrichment 
+mm.genome = BSgenome.Mmusculus.UCSC.mm10::BSgenome.Mmusculus.UCSC.mm10
+meme_db = read_meme(file.path(maindir, "Annotations", "HOCOMOCOv11_core_MOUSE_mono_meme_format.meme")) %>% to_df()
+# meme_db = read_meme(file.path(maindir, "Annotations", "H13CORE_meme_format.meme")) %>% to_df()
+meme_db = to_list(meme_db)
+
+meme_db_jaspar = list()
+file = list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))[1]
+
+for (file in list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))){
+  jaspar_to_add = read_meme(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme", file))
+  meme_db_jaspar = c(meme_db_jaspar, jaspar_to_add)
+}
+meme_db_jaspar = meme_db_jaspar %>%
+  to_df() %>%
+  mutate(name = paste0(altname, "_", name)) %>%
+  to_list()
+    
+Motif_diff_UP = DA %>% dplyr::filter(logFC.group > 0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Motif_diff_Down = DA %>% dplyr::filter(logFC.group < -0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Background = DA %>% dplyr::filter(abs(logFC.group) < 0.2) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique() %>% sample(size = (10*max(length(Motif_diff_Down),length(Motif_diff_UP))))
+
+AME_LP_HS1 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS1)
+AME_LP_HS2 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db)
+head(AME_LP_HS2)
+AME_LP_HS3 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS3)
+AME_LP_HS4 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db)
+head(AME_LP_HS4)
+                                                                    ## Motif detected ##
+
+    pdf(file.path(maindir, "Output", "Motif_Enrichment_CD62L-_stem_cells_Drug_vs_No_Drug_1Kbins.pdf"), width = 9)
+AME_LP_HS1 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS1, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Cell line CD62 L- - Drug vs WT \n - UPregulated peaks - Jaspar database")
+
+AME_LP_HS2 = AME_LP_HS2 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id))
+AME_LP_HS2 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS2, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Cell line CD62 L- - Drug vs WT \n - UPregulated peaks - Hocomoco database")
+
+AME_LP_HS3 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS3, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Cell line CD62 L- - Drug vs WT \n - Downregulated peaks - Jaspar database")
+
+# AME_LP_HS4 = AME_LP_HS4 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id))
+# AME_LP_HS4 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS4, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+#     ggtitle("Motif Enrichment - Cell line CD62 L- - Drug vs WT \n - Downregulated peaks - Hocomoco database")
+   dev.off()
+   
+    write.csv(AME_LP_HS1, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L-_stem_cells_Drug_vs_No_Drug_1Kbins_Upregulated_peaks_JASPAR.csv"), row.names = F)
+    write.csv(AME_LP_HS2, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L-_stem_cells_Drug_vs_No_Drug_1Kbins_Upregulated_peaks_HOCOMOCO.csv"), row.names = F)
+        write.csv(AME_LP_HS3, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L-_stem_cells_Drug_vs_No_Drug_1Kbins_Downregulated_peaks_JASPAR.csv"), row.names = F)
+    # write.csv(AME_LP_HS4, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L-_stem_cells_Drug_vs_No_Drug_1Kbins_Downregulated_peaks_HOCOMOCO.csv"), row.names = F)
+
+            #### CD62L + ###
+      
+   DA = read.csv(file.path(maindir, "Output","Objects","DA_CD62L+_stem_cells_Drug_vs_No_Drug.csv"))
+    DA <- DA %>%
+  mutate(seqnames = gsub("(chr.*)_(.*)_(.*)", "\\1",ID),
+         start = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\2",ID)), 
+         end = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\3",ID)))
+
+#Motif Enrichment 
+mm.genome = BSgenome.Mmusculus.UCSC.mm10::BSgenome.Mmusculus.UCSC.mm10
+meme_db = read_meme(file.path(maindir, "Annotations", "HOCOMOCOv11_core_MOUSE_mono_meme_format.meme")) %>% to_df()
+# meme_db = read_meme(file.path(maindir, "Annotations", "H13CORE_meme_format.meme")) %>% to_df()
+meme_db = to_list(meme_db)
+
+meme_db_jaspar = list()
+file = list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))[1]
+
+for (file in list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))){
+  jaspar_to_add = read_meme(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme", file))
+  meme_db_jaspar = c(meme_db_jaspar, jaspar_to_add)
+}
+meme_db_jaspar = meme_db_jaspar %>%
+  to_df() %>%
+  mutate(name = paste0(altname, "_", name)) %>%
+  to_list()
+    
+Motif_diff_UP = DA %>% dplyr::filter(logFC.group > 0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Motif_diff_Down = DA %>% dplyr::filter(logFC.group < -0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Background = DA %>% dplyr::filter(abs(logFC.group) < 0.2) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique() %>% sample(size = (10*max(length(Motif_diff_Down),length(Motif_diff_UP))))
+
+AME_LP_HS1 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS1)
+AME_LP_HS2 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db)
+head(AME_LP_HS2)
+AME_LP_HS3 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS3)
+AME_LP_HS4 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db)
+head(AME_LP_HS4)
+                                                                    ## Motif detected ##
+
+    pdf(file.path(maindir, "Output", "Motif_Enrichment_CD62L+_stem_cells_Drug_vs_No_Drug_1Kbins.pdf"), width = 9)
+AME_LP_HS1 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS1, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Cell line CD62 L+ - Drug vs WT \n - UPregulated peaks - Jaspar database")
+
+# AME_LP_HS2 = AME_LP_HS2 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id))
+# AME_LP_HS2 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS2, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+#     ggtitle("Motif Enrichment - Cell line CD62 L+ - Drug vs WT \n - UPregulated peaks - Hocomoco database")
+# 
+# AME_LP_HS3 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS3, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+#     ggtitle("Motif Enrichment - Cell line CD62 L+ - Drug vs WT \n - Downregulated peaks - Jaspar database")
+
+AME_LP_HS4 = AME_LP_HS4 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id))
+AME_LP_HS4 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS4, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Cell line CD62 L+ - Drug vs WT \n - Downregulated peaks - Hocomoco database")
+   dev.off()
+
+    write.csv(AME_LP_HS1, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L+_stem_cells_Drug_vs_No_Drug_1Kbins_Upregulated_peaks_JASPAR.csv"), row.names = F)
+    # write.csv(AME_LP_HS2, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L+_stem_cells_Drug_vs_No_Drug_1Kbins_Upregulated_peaks_HOCOMOCO.csv"), row.names = F)
+    # write.csv(AME_LP_HS3, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L+_stem_cells_Drug_vs_No_Drug_1Kbins_Downregulated_peaks_JASPAR.csv"), row.names = F)
+    write.csv(AME_LP_HS4, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L+_stem_cells_Drug_vs_No_Drug_1Kbins_Downregulated_peaks_HOCOMOCO.csv"), row.names = F)
+
+############################################# Mouse ##
+   #### 62 neg ###
+      
+   DA = read.csv(file.path(maindir, "Output","Objects","DA_Mouse_62neg_Tg_vs_WT.csv"))
+    DA <- DA %>%
+  mutate(seqnames = gsub("(chr.*)_(.*)_(.*)", "\\1",ID),
+         start = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\2",ID)), 
+         end = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\3",ID)))
+
+#Motif Enrichment 
+mm.genome = BSgenome.Mmusculus.UCSC.mm10::BSgenome.Mmusculus.UCSC.mm10
+meme_db = read_meme(file.path(maindir, "Annotations", "HOCOMOCOv11_core_MOUSE_mono_meme_format.meme")) %>% to_df()
+# meme_db = read_meme(file.path(maindir, "Annotations", "H13CORE_meme_format.meme")) %>% to_df()
+meme_db = to_list(meme_db)
+
+meme_db_jaspar = list()
+file = list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))[1]
+
+for (file in list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))){
+  jaspar_to_add = read_meme(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme", file))
+  meme_db_jaspar = c(meme_db_jaspar, jaspar_to_add)
+}
+meme_db_jaspar = meme_db_jaspar %>%
+  to_df() %>%
+  mutate(name = paste0(altname, "_", name)) %>%
+  to_list()
+    
+Motif_diff_UP = DA %>% dplyr::filter(logFC.group > 0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Motif_diff_Down = DA %>% dplyr::filter(logFC.group < -0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Background = DA %>% dplyr::filter(abs(logFC.group) < 0.2) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique() %>% sample(size = (10*max(length(Motif_diff_Down),length(Motif_diff_UP))))
+
+AME_LP_HS1 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS1)
+AME_LP_HS2 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db)
+head(AME_LP_HS2)
+AME_LP_HS3 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS3)
+AME_LP_HS4 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db)
+head(AME_LP_HS4)
+                                                                    ## Motif detected ##
+
+    pdf(file.path(maindir, "Output", "Motif_Enrichment_Mouse_62neg_Tg_vs_WT_1Kbins.pdf"), width = 9)
+# AME_LP_HS1 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS1, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Mouse_62neg_Tg_vs_WT \n - UPregulated peaks - Jaspar database")
+# 
+# AME_LP_HS2 = AME_LP_HS2 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id)) 
+# AME_LP_HS2 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS2, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Mouse_62neg_Tg_vs_WT \n - UPregulated peaks - Hocomoco database")
+# 
+AME_LP_HS3 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS3, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Mouse_62neg_Tg_vs_WT \n - Downregulated peaks - Jaspar database")
+
+# AME_LP_HS4 = AME_LP_HS4 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id))
+# AME_LP_HS4 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS4, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+#     ggtitle("Motif Enrichment - Mouse_62neg_Tg_vs_WT \n - Downregulated peaks - Hocomoco database")
+   dev.off()
+   
+    # write.csv(AME_LP_HS1, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62neg_Tg_vs_WT_1Kbins_Upregulated_peaks_JASPAR.csv"), row.names = F)
+    # write.csv(AME_LP_HS2, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62neg_Tg_vs_WT_1Kbins_Upregulated_peaks_HOCOMOCO.csv"), row.names = F)
+    write.csv(AME_LP_HS3, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62neg_Tg_vs_WT_1Kbins_Downregulated_peaks_JASPAR.csv"), row.names = F)
+    # write.csv(AME_LP_HS4, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62neg_Tg_vs_WT_1Kbins_Downregulated_peaks_HOCOMOCO.csv"), row.names = F)
+
+           #### 62 high ###
+      
+   DA = read.csv(file.path(maindir, "Output","Objects","DA_Mouse_62high_Tg_vs_WT.csv"))
+    DA <- DA %>%
+  mutate(seqnames = gsub("(chr.*)_(.*)_(.*)", "\\1",ID),
+         start = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\2",ID)), 
+         end = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\3",ID)))
+
+#Motif Enrichment 
+mm.genome = BSgenome.Mmusculus.UCSC.mm10::BSgenome.Mmusculus.UCSC.mm10
+meme_db = read_meme(file.path(maindir, "Annotations", "HOCOMOCOv11_core_MOUSE_mono_meme_format.meme")) %>% to_df()
+# meme_db = read_meme(file.path(maindir, "Annotations", "H13CORE_meme_format.meme")) %>% to_df()
+meme_db = to_list(meme_db)
+
+meme_db_jaspar = list()
+file = list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))[1]
+
+for (file in list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))){
+  jaspar_to_add = read_meme(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme", file))
+  meme_db_jaspar = c(meme_db_jaspar, jaspar_to_add)
+}
+meme_db_jaspar = meme_db_jaspar %>%
+  to_df() %>%
+  mutate(name = paste0(altname, "_", name)) %>%
+  to_list()
+    
+# Motif_diff_UP = DA %>% dplyr::filter(logFC.group > 0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Motif_diff_Down = DA %>% dplyr::filter(logFC.group < -0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Background = DA %>% dplyr::filter(abs(logFC.group) < 0.2) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique() %>% sample(size = (10*length(Motif_diff_Down)))
+
+# AME_LP_HS1 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db_jaspar)
+# head(AME_LP_HS1)
+# AME_LP_HS2 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db)
+# head(AME_LP_HS2)
+AME_LP_HS3 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS3)
+AME_LP_HS4 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db)
+head(AME_LP_HS4)
+                                                                    ## Motif detected only in AME 3 & 4 ##
+
+    pdf(file.path(maindir, "Output", "Motif_Enrichment_Mouse_62high_Tg_vs_WT_1Kbins.pdf"), width = 9)
+# AME_LP_HS1 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS1, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Mouse_62high_Tg_vs_WT \n - UPregulated peaks - Jaspar database")
+# 
+# AME_LP_HS2 = AME_LP_HS2 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id)) 
+# AME_LP_HS2 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS2, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Mouse_62high_Tg_vs_WT \n - UPregulated peaks - Hocomoco database")
+# 
+AME_LP_HS3 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS3, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Mouse_62high_Tg_vs_WT \n - Downregulated peaks - Jaspar database")
+
+AME_LP_HS4 = AME_LP_HS4 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id))
+AME_LP_HS4 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS4, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Mouse_62high_Tg_vs_WT \n - Downregulated peaks - Hocomoco database")
+   dev.off()
+   
+    # write.csv(AME_LP_HS1, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62high_Tg_vs_WT_1Kbins_Upregulated_peaks_JASPAR.csv"), row.names = F)
+    # write.csv(AME_LP_HS2, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62high_Tg_vs_WT_1Kbins_Upregulated_peaks_HOCOMOCO.csv"), row.names = F)
+        write.csv(AME_LP_HS3, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62high_Tg_vs_WT_1Kbins_Downregulated_peaks_JASPAR.csv"), row.names = F)
+    write.csv(AME_LP_HS4, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62high_Tg_vs_WT_1Kbins_Downregulated_peaks_HOCOMOCO.csv"), row.names = F)
+    
+```
+
+```{r Get top 5K bins per sample to then use them to make DA and call motifs}
+
+feature_Granges = define_feature(ref = "mm10", bin_width = 5000)
+FeatureMatrix_5K = wrapper_Signac_FeatureMatrix(file.path(maindir,"Input", "Fragments_bin"), which = feature_Granges, ref = "mm10", process_n = 30000)
+qs::qsave(FeatureMatrix_5K, file.path(maindir, "Input", "FeatureMatrix_5K.qs"))
+
+FeatureMatrix_5K = qs::qread(file.path(maindir, "Input", "FeatureMatrix_5K.qs"))
+datamatrix = FeatureMatrix_5K$datamatrix
+annot_raw = FeatureMatrix_5K$annot_raw
+
+annot_raw$sample_id = sub(".fragments","", annot_raw$sample_id)
+annot_raw$cell_id = sub(".fragments","", annot_raw$cell_id)
+
+colnames(datamatrix) = annot_raw$cell_id
+rownames(annot_raw) = annot_raw$cell_id
+
+# Load annot made previously 
+col_data = read.csv(file.path(maindir, "Output","Objects","coldata_scExp50K_all_samples.csv"), row.names = "X")
+
+############################################ For stem cells ############################################
+col_data_stemcells = col_data %>% dplyr::filter(group_id == "stem_cells")
+idx <- match(col_data_stemcells$cell_id, colnames(datamatrix))
+datamatrix_stemcells <- datamatrix[,idx]
+
+ scExp_5K = create_scExp(datamatrix_stemcells, col_data_stemcells,
+                         remove_zero_cells = TRUE,
+                         remove_zero_features = TRUE)
+  
+   plot_distribution_scExp(scExp_5K, log10 = T) 
+ 
+  scExp_5K = normalize_scExp(scExp_5K, type = "CPM")
+
+
+ #### Get rownames of top 5000 expressed bins by cluster in 5K (normalize by CPM)
+  cluster = unique(col_data_stemcells$sample_id)[1]
+  top_features = c()
+  for (cluster in unique(col_data_stemcells$sample_id)){
+    cell_vec = col_data_stemcells$cell_id[which(col_data_stemcells$sample_id == cluster)]
+    tmp.mat = normcounts(scExp_5K)[,cell_vec]
+    tmp.features = rownames(tmp.mat)[order(rowSums2(tmp.mat), decreasing = T)[1:5000]]
+    top_features = c(top_features, tmp.features)
+  }
+  top_features = unique(top_features)
+  idx <- match(top_features, rownames(datamatrix))
+
+# Subset safely, preserving sparsity
+datamatrix_stemcells <- datamatrix_stemcells[idx,]
+
+  #create sc exp object with the selected bins and do Differential analysis
+   scExp_5K = create_scExp(datamatrix_stemcells, col_data_stemcells,
+                         remove_zero_cells = TRUE,
+                         remove_zero_features = TRUE)
+   
+   
+   scExp_5K = normalize_scExp(scExp_5K, type = "CPM")
+   
+   scExp_5K = feature_annotation_scExp(scExp_5K, ref = "mm10")
+   
+    scExp_5K = find_top_features(
+        scExp_5K,
+        n = nrow(scExp_5K),
+        keep_others = FALSE)
+    
+     # scExp_5K = normalize_scExp(scExp_5K, type = "TFIDF")
+   
+  scExp_5K = reduce_dims_scExp(
+        scExp_5K, n = 20,
+        dimension_reductions = c("PCA"),
+        batch_correction = FALSE, batch_list = NULL,  
+        remove_PC = NULL,
+        verbose = FALSE)
+    
+  plot_correlation_PCA_scExp(
+        scExp_5K,
+        correlation_var = "total_counts",
+        color_by = NULL,
+        topPC = 20)
+  
+  scExp_5K = reduce_dims_scExp(
+        scExp_5K, n = 20,
+        dimension_reductions = c("PCA","UMAP"), #, "TSNE"),
+        batch_correction = FALSE, batch_list = NULL,  
+        remove_PC = NULL,
+        verbose = FALSE)
+    
+  plot_correlation_PCA_scExp(
+        scExp_5K,
+        correlation_var = "total_counts",
+        color_by = NULL,
+        topPC = 20)
+  
+   scExp_5K = ChromSCape::find_clusters_louvain_scExp(scExp_5K, resolution = 1)
+  
+  plot_reduced_dim_scExp(scExp_5K, color_by = "cell_cluster", reduced_dim = "UMAP", transparency = 0.5, size = 1, downsample = dim(scExp_5K)[2], min_quantile = 0, max_quantile = 1, annotate_clusters = F) +
+     plot_reduced_dim_scExp(scExp_5K, color_by = "sample_id", reduced_dim = "UMAP", transparency = 0.5, size = 1, downsample = dim(scExp_5K)[2], min_quantile = 0, max_quantile = 1, annotate_clusters = F)
+    plot_reduced_dim_scExp(scExp_5K, color_by = "Gm10800", reduced_dim = "UMAP", transparency = 0.5, size = 1, downsample = dim(scExp_5K)[2], min_quantile = 0, max_quantile = 1, annotate_clusters = F)
+    
+     df_plot_5K = cbind(as.data.frame(colData(scExp_5K)),as.data.frame(reducedDim(scExp_5K, "UMAP")))
+  df_plot_5K = df_plot_5K[sample(1:nrow(df_plot_5K)), ]
+  
+    pdf(file.path(maindir, "Output", "UMAP_filtered_cells_Peaks_5Kbins_stem_cells.pdf"), width = 9)
+   
+  df_plot_5K %>% ggplot(aes(x = Component_1, y = Component_2, fill = cell_cluster)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_manual(values = palette_color) + theme_void() +
+   df_plot_5K %>% ggplot(aes(x = Component_1, y = Component_2, fill = log10(total_counts))) + geom_point(shape = 21, color = "grey70", size = 3) + theme_void() + scale_fill_viridis(option = "D") +
+  df_plot_5K %>% ggplot(aes(x = Component_1, y = Component_2, fill = sample_id)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_brewer(palette = "Set3") + theme_void() + 
+      df_plot_5K %>% ggplot(aes(x = Component_1, y = Component_2, fill = group_id)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_brewer(palette = "Set3") + theme_void()
+   df_plot_5K %>% ggplot(aes(Component_1, Component_2)) +
+  geom_pointdensity(size = 0.55) +
+  facet_wrap(~sample_id) +
+  coord_equal() +
+  scale_color_viridis_c(name = "sample\ndensity") +
+  theme_void()
+  dev.off()
+  
+   
+   ### differential analysis ###
+  
+  ## CD62L-_stem_cells_Drug_vs_No_Drug 
+   scExp_5K_da = differential_analysis_scExp(scExp_5K, de_type = "custom", by = c("sample_id", "sample_id"),group = data.frame(group = c("CD62L-_stem_cells_with_drug_tagged")), ref = data.frame(ref = c("CD62L-_stem_cells_no_drug_tagged")), prioritize_genes = F, method = "neg.binomial")
+    DA = as.data.frame(rowData(scExp_5K_da))
+    DA = DA %>% mutate(status = case_when(qval.group > 0.05 ~ "Not Sig",
+                                                    abs(logFC.group) < 0.5 ~ "Not Sig",
+                                        qval.group < 0.05 & logFC.group < -0.5 ~ "Down",
+                                        qval.group < 0.05 & logFC.group > 0.5 ~ "Up"))
+    
+    pdf(file.path(maindir, "Output", "Volcano_CD62L-_stem_cells_Drug_vs_No_Drug_5Kbins.pdf"), width = 9)
+    DA %>%
+  ggplot(aes(x = logFC.group, y = -log10(qval.group), fill = status)) + 
+  geom_point(size = 4, alpha = 0.4, shape = 21, color = "black") +   
+  geom_hline(yintercept = -log10(0.05), linetype="dashed") + 
+  geom_vline(xintercept = 0.5, linetype="dashed") +
+   geom_vline(xintercept = -0.5, linetype="dashed") +
+  theme_classic() +
+  scale_fill_manual(values = c("lightskyblue", "grey50", "tomato")) +
+  ggrepel::geom_text_repel(data = dplyr::filter(DA, -log10(qval.group) > 1.30103), aes(label = Gene), max.overlaps = 20, color = "black", size = 5) + 
+    ggtitle("Volcano Plot - CD62L-_stem_cells - Drug vs No Drug")
+    dev.off()
+    
+    write.csv(DA, file.path(maindir, "Output","Objects","DA_CD62L-_stem_cells_Drug_vs_No_Drug_5Kbins.csv"), row.names = F)
+    
+     ## CD62L+_stem_cells_Drug_vs_No_Drug 
+   scExp_5K_da = differential_analysis_scExp(scExp_5K, de_type = "custom", by = c("sample_id", "sample_id"),group = data.frame(group = c("CD62L+_stem_cells_with_drug_tagged")), ref = data.frame(ref = c("CD62L+_stem_cells_no_drug_tagged")), prioritize_genes = F, method = "neg.binomial")
+    DA = as.data.frame(rowData(scExp_5K_da))
+    DA = DA %>% mutate(status = case_when(qval.group > 0.05 ~ "Not Sig",
+                                                    abs(logFC.group) < 0.5 ~ "Not Sig",
+                                        qval.group < 0.05 & logFC.group < -0.5 ~ "Down",
+                                        qval.group < 0.05 & logFC.group > 0.5 ~ "Up"))
+    pdf(file.path(maindir, "Output", "Volcano_CD62L+_stem_cells_Drug_vs_No_Drug_5Kbins.pdf"), width = 9)
+    DA %>%
+  ggplot(aes(x = logFC.group, y = -log10(qval.group), fill = status)) + 
+  geom_point(size = 4, alpha = 0.4, shape = 21, color = "black") +   
+  geom_hline(yintercept = -log10(0.05), linetype="dashed") + 
+  geom_vline(xintercept = 0.5, linetype="dashed") +
+   geom_vline(xintercept = -0.5, linetype="dashed") +
+  theme_classic() +
+  scale_fill_manual(values = c("lightskyblue", "grey50", "tomato")) +
+  ggrepel::geom_text_repel(data = dplyr::filter(DA, -log10(qval.group) > 1.30103), aes(label = Gene), max.overlaps = 20, color = "black", size = 5) + 
+    ggtitle("Volcano Plot - CD62L+_stem_cells - Drug vs No Drug")
+    dev.off()
+    
+    write.csv(DA, file.path(maindir, "Output","Objects","DA_CD62L+_stem_cells_Drug_vs_No_Drug_5Kbins.csv"), row.names = F)
+    
+
+############################################ For Mouse ############################################
+col_data_mouse = col_data %>% dplyr::filter(group_id == "mouse")
+idx <- match(col_data_mouse$cell_id, colnames(datamatrix))
+datamatrix_mouse <- datamatrix[,idx]
+
+ scExp_5K = create_scExp(datamatrix_mouse, col_data_mouse,
+                         remove_zero_cells = TRUE,
+                         remove_zero_features = TRUE)
+  
+   plot_distribution_scExp(scExp_5K, log10 = T) 
+ 
+  scExp_5K = normalize_scExp(scExp_5K, type = "CPM")
+
+
+ #### Get rownames of top 5000 expressed bins by cluster in 5K (normalize by CPM)
+  cluster = unique(col_data_mouse$sample_id)[1]
+  top_features = c()
+  for (cluster in unique(col_data_mouse$sample_id)){
+    cell_vec = col_data_mouse$cell_id[which(col_data_mouse$sample_id == cluster)]
+    tmp.mat = normcounts(scExp_5K)[,cell_vec]
+    tmp.features = rownames(tmp.mat)[order(rowSums2(tmp.mat), decreasing = T)[1:5000]]
+    top_features = c(top_features, tmp.features)
+  }
+  top_features = unique(top_features)
+  idx <- match(top_features, rownames(datamatrix))
+
+# Subset safely, preserving sparsity
+datamatrix_mouse <- datamatrix_mouse[idx,]
+
+  #create sc exp object with the selected bins and do Differential analysis
+   scExp_5K = create_scExp(datamatrix_mouse, col_data_mouse,
+                         remove_zero_cells = TRUE,
+                         remove_zero_features = TRUE)
+   
+   
+   scExp_5K = normalize_scExp(scExp_5K, type = "CPM")
+   
+   scExp_5K = feature_annotation_scExp(scExp_5K, ref = "mm10")
+   
+    scExp_5K = find_top_features(
+        scExp_5K,
+        n = nrow(scExp_5K),
+        keep_others = FALSE)
+    
+     # scExp_5K = normalize_scExp(scExp_5K, type = "TFIDF")
+   
+  scExp_5K = reduce_dims_scExp(
+        scExp_5K, n = 20,
+        dimension_reductions = c("PCA"),
+        batch_correction = FALSE, batch_list = NULL,  
+        remove_PC = NULL,
+        verbose = FALSE)
+    
+  plot_correlation_PCA_scExp(
+        scExp_5K,
+        correlation_var = "total_counts",
+        color_by = NULL,
+        topPC = 20)
+  
+  scExp_5K = reduce_dims_scExp(
+        scExp_5K, n = 20,
+        dimension_reductions = c("PCA","UMAP"), #, "TSNE"),
+        batch_correction = FALSE, batch_list = NULL,  
+        remove_PC = NULL,
+        verbose = FALSE)
+    
+  plot_correlation_PCA_scExp(
+        scExp_5K,
+        correlation_var = "total_counts",
+        color_by = NULL,
+        topPC = 20)
+  
+   scExp_5K = ChromSCape::find_clusters_louvain_scExp(scExp_5K, resolution = 1)
+  
+  plot_reduced_dim_scExp(scExp_5K, color_by = "cell_cluster", reduced_dim = "UMAP", transparency = 0.5, size = 1, downsample = dim(scExp_5K)[2], min_quantile = 0, max_quantile = 1, annotate_clusters = F) +
+     plot_reduced_dim_scExp(scExp_5K, color_by = "sample_id", reduced_dim = "UMAP", transparency = 0.5, size = 1, downsample = dim(scExp_5K)[2], min_quantile = 0, max_quantile = 1, annotate_clusters = F)
+    
+     df_plot_5K = cbind(as.data.frame(colData(scExp_5K)),as.data.frame(reducedDim(scExp_5K, "UMAP")))
+  df_plot_5K = df_plot_5K[sample(1:nrow(df_plot_5K)), ]
+  
+    pdf(file.path(maindir, "Output", "UMAP_filtered_cells_Peaks_5Kbins_mouse.pdf"), width = 9)
+   
+  df_plot_5K %>% ggplot(aes(x = Component_1, y = Component_2, fill = cell_cluster)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_manual(values = palette_color) + theme_void() +
+   df_plot_5K %>% ggplot(aes(x = Component_1, y = Component_2, fill = log10(total_counts))) + geom_point(shape = 21, color = "grey70", size = 3) + theme_void() + scale_fill_viridis(option = "D") +
+  df_plot_5K %>% ggplot(aes(x = Component_1, y = Component_2, fill = sample_id)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_brewer(palette = "Set3") + theme_void() + 
+      df_plot_5K %>% ggplot(aes(x = Component_1, y = Component_2, fill = group_id)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_brewer(palette = "Set3") + theme_void()
+  df_plot_5K %>% ggplot(aes(Component_1, Component_2)) +
+  geom_pointdensity(size = 0.55) +
+  facet_wrap(~sample_id) +
+  coord_equal() +
+  scale_color_viridis_c(name = "sample\ndensity") +
+  theme_void()
+  
+  dev.off()
+  
+   
+   ### differential analysis ###
+  
+  ## Mouse_62neg_Tg_vs_WT
+   scExp_5K_da = differential_analysis_scExp(scExp_5K, de_type = "custom", by = c("sample_id", "sample_id"),group = data.frame(group = c("m64_m68_Tg_62neg_tagged")), ref = data.frame(ref = c("m61_m66_WT_62neg_tagged")), prioritize_genes = F, method = "neg.binomial")
+    DA = as.data.frame(rowData(scExp_5K_da))
+    DA = DA %>% mutate(status = case_when(qval.group > 0.05 ~ "Not Sig",
+                                                    abs(logFC.group) < 0.5 ~ "Not Sig",
+                                        qval.group < 0.05 & logFC.group < -0.5 ~ "Down",
+                                        qval.group < 0.05 & logFC.group > 0.5 ~ "Up"))
+    pdf(file.path(maindir, "Output", "Volcano_Mouse_62neg_Tg_vs_WT_5Kbins.pdf"), width = 9)
+    DA %>%
+  ggplot(aes(x = logFC.group, y = -log10(qval.group), fill = status)) + 
+  geom_point(size = 4, alpha = 0.4, shape = 21, color = "black") +   
+  geom_hline(yintercept = -log10(0.05), linetype="dashed") + 
+  geom_vline(xintercept = 0.5, linetype="dashed") +
+   geom_vline(xintercept = -0.5, linetype="dashed") +
+  theme_classic() +
+  scale_fill_manual(values = c("lightskyblue", "grey50", "tomato")) +
+  ggrepel::geom_text_repel(data = dplyr::filter(DA, -log10(qval.group) > 1.30103), aes(label = Gene), max.overlaps = 20, color = "black", size = 5) + 
+    ggtitle("Volcano Plot - Mouse 62 neg - Tg vs WT")
+    dev.off()
+    
+    write.csv(DA, file.path(maindir, "Output","Objects","DA_Mouse_62neg_Tg_vs_WT_5Kbins.csv"), row.names = F)
+    
+    ## Mouse_62hi_Tg_vs_WT
+     scExp_5K_da = differential_analysis_scExp(scExp_5K, de_type = "custom", by = c("sample_id", "sample_id"),group = data.frame(group = c("m64_m68_Tg_62hi_tagged")), ref = data.frame(ref = c("m61_m66_WT_62hi_tagged")), prioritize_genes = F, method = "neg.binomial")
+      DA = as.data.frame(rowData(scExp_5K_da))
+      DA = DA %>% mutate(status = case_when(qval.group > 0.05 ~ "Not Sig",
+                                                      abs(logFC.group) < 0.5 ~ "Not Sig",
+                                          qval.group < 0.05 & logFC.group < -0.5 ~ "Down",
+                                          qval.group < 0.05 & logFC.group > 0.5 ~ "Up"))
+      pdf(file.path(maindir, "Output", "Volcano_Mouse_62hi_Tg_vs_WT_5Kbins.pdf"), width = 9)
+      DA %>%
+    ggplot(aes(x = logFC.group, y = -log10(qval.group), fill = status)) + 
+    geom_point(size = 4, alpha = 0.4, shape = 21, color = "black") +   
+    geom_hline(yintercept = -log10(0.05), linetype="dashed") + 
+    geom_vline(xintercept = 0.5, linetype="dashed") +
+     geom_vline(xintercept = -0.5, linetype="dashed") +
+    theme_classic() +
+    scale_fill_manual(values = c("lightskyblue", "grey50", "tomato")) +
+    ggrepel::geom_text_repel(data = dplyr::filter(DA, -log10(qval.group) > 1.30103), aes(label = Gene), max.overlaps = 30, color = "black", size = 5) + 
+      ggtitle("Volcano Plot - Mouse 62 high - Tg vs WT")
+      dev.off()
+      
+      write.csv(DA, file.path(maindir, "Output","Objects","DA_Mouse_62high_Tg_vs_WT_5Kbins.csv"), row.names = F)
+    
+
+############################################  TF ANALYSIS ##################
+    
+   
+   ####  Cell Line ###
+      #### CD62L - ###
+      
+   DA = read.csv(file.path(maindir, "Output","Objects","DA_CD62L-_stem_cells_Drug_vs_No_Drug_5Kbins.csv"))
+    DA <- DA %>%
+  mutate(seqnames = gsub("(chr.*)_(.*)_(.*)", "\\1",ID),
+         start = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\2",ID)), 
+         end = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\3",ID)))
+
+#Motif Enrichment 
+mm.genome = BSgenome.Mmusculus.UCSC.mm10::BSgenome.Mmusculus.UCSC.mm10
+meme_db = read_meme(file.path(maindir, "Annotations", "HOCOMOCOv11_core_MOUSE_mono_meme_format.meme")) %>% to_df()
+# meme_db = read_meme(file.path(maindir, "Annotations", "H13CORE_meme_format.meme")) %>% to_df()
+meme_db = to_list(meme_db)
+
+meme_db_jaspar = list()
+file = list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))[1]
+
+for (file in list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))){
+  jaspar_to_add = read_meme(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme", file))
+  meme_db_jaspar = c(meme_db_jaspar, jaspar_to_add)
+}
+meme_db_jaspar = meme_db_jaspar %>%
+  to_df() %>%
+  mutate(name = paste0(altname, "_", name)) %>%
+  to_list()
+    
+Motif_diff_UP = DA %>% dplyr::filter(logFC.group > 0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Motif_diff_Down = DA %>% dplyr::filter(logFC.group < -0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Background = DA %>% dplyr::filter(abs(logFC.group) < 0.2) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique() %>% sample(size = (10*max(length(Motif_diff_Down),length(Motif_diff_UP))))
+
+AME_LP_HS1 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS1)
+AME_LP_HS2 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db)
+head(AME_LP_HS2)
+AME_LP_HS3 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS3)
+AME_LP_HS4 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db)
+head(AME_LP_HS4)
+                                                                    ## Motif detected ##
+
+    pdf(file.path(maindir, "Output", "Motif_Enrichment_CD62L-_stem_cells_Drug_vs_No_Drug_5Kbins.pdf"), width = 9)
+# AME_LP_HS1 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS1, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Cell line CD62 L- - Drug vs WT \n - UPregulated peaks - Jaspar database")
+# 
+# AME_LP_HS2 = AME_LP_HS2 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id)) 
+# AME_LP_HS2 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS2, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Cell line CD62 L- - Drug vs WT \n - UPregulated peaks - Hocomoco database")
+# 
+# AME_LP_HS3 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS3, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+#     ggtitle("Motif Enrichment - Cell line CD62 L- - Drug vs WT \n - Downregulated peaks - Jaspar database")
+# 
+AME_LP_HS4 = AME_LP_HS4 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id))
+AME_LP_HS4 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS4, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Cell line CD62 L- - Drug vs WT \n - Downregulated peaks - Hocomoco database")
+   dev.off()
+   
+    # write.csv(AME_LP_HS1, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L-_stem_cells_Drug_vs_No_Drug_5Kbins_Upregulated_peaks_JASPAR.csv"), row.names = F)
+    # write.csv(AME_LP_HS2, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L-_stem_cells_Drug_vs_No_Drug_5Kbins_Upregulated_peaks_HOCOMOCO.csv"), row.names = F)
+        # write.csv(AME_LP_HS3, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L-_stem_cells_Drug_vs_No_Drug_5Kbins_Downregulated_peaks_JASPAR.csv"), row.names = F)
+    write.csv(AME_LP_HS4, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L-_stem_cells_Drug_vs_No_Drug_5Kbins_Downregulated_peaks_HOCOMOCO.csv"), row.names = F)
+
+            #### CD62L + ###
+      
+   DA = read.csv(file.path(maindir, "Output","Objects","DA_CD62L+_stem_cells_Drug_vs_No_Drug_5Kbins.csv"))
+    DA <- DA %>%
+  mutate(seqnames = gsub("(chr.*)_(.*)_(.*)", "\\1",ID),
+         start = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\2",ID)), 
+         end = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\3",ID)))
+
+#Motif Enrichment 
+mm.genome = BSgenome.Mmusculus.UCSC.mm10::BSgenome.Mmusculus.UCSC.mm10
+meme_db = read_meme(file.path(maindir, "Annotations", "HOCOMOCOv11_core_MOUSE_mono_meme_format.meme")) %>% to_df()
+# meme_db = read_meme(file.path(maindir, "Annotations", "H13CORE_meme_format.meme")) %>% to_df()
+meme_db = to_list(meme_db)
+
+meme_db_jaspar = list()
+file = list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))[1]
+
+for (file in list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))){
+  jaspar_to_add = read_meme(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme", file))
+  meme_db_jaspar = c(meme_db_jaspar, jaspar_to_add)
+}
+meme_db_jaspar = meme_db_jaspar %>%
+  to_df() %>%
+  mutate(name = paste0(altname, "_", name)) %>%
+  to_list()
+    
+Motif_diff_UP = DA %>% dplyr::filter(logFC.group > 0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Motif_diff_Down = DA %>% dplyr::filter(logFC.group < -0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Background = DA %>% dplyr::filter(abs(logFC.group) < 0.2) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique() %>% sample(size = (10*max(length(Motif_diff_Down),length(Motif_diff_UP))))
+
+AME_LP_HS1 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS1)
+AME_LP_HS2 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db)
+head(AME_LP_HS2)
+AME_LP_HS3 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS3)
+AME_LP_HS4 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db)
+head(AME_LP_HS4)
+                                                                    ## Motif detected ##
+
+    pdf(file.path(maindir, "Output", "Motif_Enrichment_CD62L+_stem_cells_Drug_vs_No_Drug_5Kbins.pdf"), width = 9)
+# AME_LP_HS1 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS1, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Cell line CD62 L+ - Drug vs WT \n - UPregulated peaks - Jaspar database")
+# 
+# AME_LP_HS2 = AME_LP_HS2 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id)) 
+# AME_LP_HS2 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS2, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Cell line CD62 L+ - Drug vs WT \n - UPregulated peaks - Hocomoco database")
+# 
+AME_LP_HS3 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS3, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Cell line CD62 L+ - Drug vs WT \n - Downregulated peaks - Jaspar database")
+
+AME_LP_HS4 = AME_LP_HS4 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id))
+AME_LP_HS4 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS4, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Cell line CD62 L+ - Drug vs WT \n - Downregulated peaks - Hocomoco database")
+   dev.off()
+   
+    # write.csv(AME_LP_HS1, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L+_stem_cells_Drug_vs_No_Drug_5Kbins_Upregulated_peaks_JASPAR.csv"), row.names = F)
+    # write.csv(AME_LP_HS2, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L+_stem_cells_Drug_vs_No_Drug_5Kbins_Upregulated_peaks_HOCOMOCO.csv"), row.names = F)
+    write.csv(AME_LP_HS3, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L+_stem_cells_Drug_vs_No_Drug_5Kbins_Downregulated_peaks_JASPAR.csv"), row.names = F)
+    write.csv(AME_LP_HS4, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L+_stem_cells_Drug_vs_No_Drug_5Kbins_Downregulated_peaks_HOCOMOCO.csv"), row.names = F)
+
+############################################# Mouse ##
+   #### 62 neg ###
+      
+   DA = read.csv(file.path(maindir, "Output","Objects","DA_Mouse_62neg_Tg_vs_WT_5Kbins.csv"))
+    DA <- DA %>%
+  mutate(seqnames = gsub("(chr.*)_(.*)_(.*)", "\\1",ID),
+         start = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\2",ID)), 
+         end = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\3",ID)))
+
+#Motif Enrichment 
+mm.genome = BSgenome.Mmusculus.UCSC.mm10::BSgenome.Mmusculus.UCSC.mm10
+meme_db = read_meme(file.path(maindir, "Annotations", "HOCOMOCOv11_core_MOUSE_mono_meme_format.meme")) %>% to_df()
+# meme_db = read_meme(file.path(maindir, "Annotations", "H13CORE_meme_format.meme")) %>% to_df()
+meme_db = to_list(meme_db)
+
+meme_db_jaspar = list()
+file = list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))[1]
+
+for (file in list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))){
+  jaspar_to_add = read_meme(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme", file))
+  meme_db_jaspar = c(meme_db_jaspar, jaspar_to_add)
+}
+meme_db_jaspar = meme_db_jaspar %>%
+  to_df() %>%
+  mutate(name = paste0(altname, "_", name)) %>%
+  to_list()
+    
+Motif_diff_UP = DA %>% dplyr::filter(logFC.group > 0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Motif_diff_Down = DA %>% dplyr::filter(logFC.group < -0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Background = DA %>% dplyr::filter(abs(logFC.group) < 0.2) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique() %>% sample(size = (10*max(length(Motif_diff_Down),length(Motif_diff_UP))))
+
+AME_LP_HS1 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS1)
+AME_LP_HS2 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db)
+head(AME_LP_HS2)
+AME_LP_HS3 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS3)
+AME_LP_HS4 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db)
+head(AME_LP_HS4)
+                                                                    ## Motif detected  ##
+
+    pdf(file.path(maindir, "Output", "Motif_Enrichment_Mouse_62neg_Tg_vs_WT_5Kbins.pdf"), width = 9)
+# AME_LP_HS1 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS1, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Mouse_62neg_Tg_vs_WT \n - UPregulated peaks - Jaspar database")
+# 
+# AME_LP_HS2 = AME_LP_HS2 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id)) 
+# AME_LP_HS2 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS2, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Mouse_62neg_Tg_vs_WT \n - UPregulated peaks - Hocomoco database")
+# 
+# AME_LP_HS3 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS3, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+#     ggtitle("Motif Enrichment - Mouse_62neg_Tg_vs_WT \n - Downregulated peaks - Jaspar database")
+# 
+AME_LP_HS4 = AME_LP_HS4 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id))
+AME_LP_HS4 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS4, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Mouse_62neg_Tg_vs_WT \n - Downregulated peaks - Hocomoco database")
+   dev.off()
+   
+    # write.csv(AME_LP_HS1, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62neg_Tg_vs_WT_5Kbins_Upregulated_peaks_JASPAR.csv"), row.names = F)
+    # write.csv(AME_LP_HS2, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62neg_Tg_vs_WT_5Kbins_Upregulated_peaks_HOCOMOCO.csv"), row.names = F)
+        # write.csv(AME_LP_HS3, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62neg_Tg_vs_WT_5Kbins_Downregulated_peaks_JASPAR.csv"), row.names = F)
+    write.csv(AME_LP_HS4, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62neg_Tg_vs_WT_5Kbins_Downregulated_peaks_HOCOMOCO.csv"), row.names = F)
+
+           #### 62 high ###
+      
+   DA = read.csv(file.path(maindir, "Output","Objects","DA_Mouse_62high_Tg_vs_WT_5Kbins.csv"))
+    DA <- DA %>%
+  mutate(seqnames = gsub("(chr.*)_(.*)_(.*)", "\\1",ID),
+         start = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\2",ID)), 
+         end = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\3",ID)))
+
+#Motif Enrichment 
+mm.genome = BSgenome.Mmusculus.UCSC.mm10::BSgenome.Mmusculus.UCSC.mm10
+meme_db = read_meme(file.path(maindir, "Annotations", "HOCOMOCOv11_core_MOUSE_mono_meme_format.meme")) %>% to_df()
+# meme_db = read_meme(file.path(maindir, "Annotations", "H13CORE_meme_format.meme")) %>% to_df()
+meme_db = to_list(meme_db)
+
+meme_db_jaspar = list()
+file = list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))[1]
+
+for (file in list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))){
+  jaspar_to_add = read_meme(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme", file))
+  meme_db_jaspar = c(meme_db_jaspar, jaspar_to_add)
+}
+meme_db_jaspar = meme_db_jaspar %>%
+  to_df() %>%
+  mutate(name = paste0(altname, "_", name)) %>%
+  to_list()
+    
+Motif_diff_UP = DA %>% dplyr::filter(logFC.group > 0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Motif_diff_Down = DA %>% dplyr::filter(logFC.group < -0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Background = DA %>% dplyr::filter(abs(logFC.group) < 0.2) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique() %>% sample(size = (10*max(length(Motif_diff_Down),length(Motif_diff_UP))))
+
+AME_LP_HS1 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS1)
+AME_LP_HS2 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db)
+head(AME_LP_HS2)
+AME_LP_HS3 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS3)
+AME_LP_HS4 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db)
+head(AME_LP_HS4)
+                                                                    ## Motif detected ##
+
+    pdf(file.path(maindir, "Output", "Motif_Enrichment_Mouse_62high_Tg_vs_WT_5Kbins.pdf"), width = 9)
+# AME_LP_HS1 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS1, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Mouse_62high_Tg_vs_WT \n - UPregulated peaks - Jaspar database")
+# 
+# AME_LP_HS2 = AME_LP_HS2 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id)) 
+# AME_LP_HS2 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS2, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Mouse_62high_Tg_vs_WT \n - UPregulated peaks - Hocomoco database")
+# 
+AME_LP_HS3 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS3, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Mouse_62high_Tg_vs_WT \n - Downregulated peaks - Jaspar database")
+
+AME_LP_HS4 = AME_LP_HS4 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id))
+AME_LP_HS4 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS4, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Mouse_62high_Tg_vs_WT \n - Downregulated peaks - Hocomoco database")
+   dev.off()
+   
+    # write.csv(AME_LP_HS1, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62high_Tg_vs_WT_5Kbins_Upregulated_peaks_JASPAR.csv"), row.names = F)
+    # write.csv(AME_LP_HS2, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62high_Tg_vs_WT_5Kbins_Upregulated_peaks_HOCOMOCO.csv"), row.names = F)
+        write.csv(AME_LP_HS3, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62high_Tg_vs_WT_5Kbins_Downregulated_peaks_JASPAR.csv"), row.names = F)
+    write.csv(AME_LP_HS4, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62high_Tg_vs_WT_5Kbins_Downregulated_peaks_HOCOMOCO.csv"), row.names = F)
+    
+```
+
+#### UNFINISHED / TESTS #####
+
+
+```{r Test : use ChromVAR}
+
+# core
+library(SummarizedExperiment)
+library(GenomicRanges)
+
+# chromVAR
+library(chromVAR)
+library(motifmatchr)
+library(BSgenome.Mmusculus.UCSC.mm10)  # or your genome
+library(JASPAR2020)
+library(TFBSTools)
+
+genome_used <- BSgenome.Mmusculus.UCSC.mm10
+
+#Use scExp_1K already computed 
+scExp_1K
+sce <- scExp_1K   # just rename for convenience
+
+# parse rownames: e.g. "chr2_98667001_98668000"
+peak_strings <- rownames(sce)
+
+peak_gr <- do.call("c", lapply(peak_strings, function(x) {
+  parts <- strsplit(x, "_")[[1]]
+  GRanges(
+    seqnames = parts[1],
+    ranges = IRanges(
+      start = as.integer(parts[2]),
+      end   = as.integer(parts[3])
+    )
+  )
+}))
+
+names(peak_gr) <- peak_strings
+
+rowRanges(sce) <- peak_gr
+
+# add GC content / peak width
+sce <- addGCBias(sce, genome = genome_used)
+
+# optional: filter out very low-signal peaks
+sce <- filterPeaks(sce, min_fragments = 5)  # adjust threshold if needed
+
+# get JASPAR TF motifs (human or mouse; species is not super critical,
+# but you can match to your organism)
+opts <- list(species = 9606, all_versions = FALSE)   # human
+opts <- list(species = 10090, all_versions = FALSE) # mouse
+
+motifs <- TFBSTools::getMatrixSet(JASPAR2020, opts)
+
+# match motifs to peaks
+
+motifs <- getJasparMotifs(species = "Mus musculus")
+motif_ix <- matchMotifs(
+  motifs,
+  rowRanges(sce),
+  genome = genome_used
+)
+
+set.seed(1)
+
+background_peaks <- getBackgroundPeaks(sce)
+
+dev <- computeDeviations(
+  object = sce,
+  annotations = motif_ix,
+  background_peaks = background_peaks
+)
+rownames(dev) <- paste(rownames(dev), rowData(dev)$name, sep = "_")
+# per-cell motif deviation matrices:
+motif_dev_raw <- deviations(dev)        # motif × cell, raw deviations
+motif_dev_z   <- deviationScores(dev)   # motif × cell, z-scores (usually used)
+
+diff_acc <- differentialDeviations(dev, "sample_id")
+
+head(diff_acc[order(diff_acc$p_value_adjusted),], 10)
+interesting_Tfs = rownames(diff_acc)[which(diff_acc$p_value_adjusted < 0.05)]
+
+diff_var <- differentialVariability(dev, "sample_id")
+
+head(diff_var)
+
+variability <- computeVariability(dev)
+plotVariability(variability, use_plotly = FALSE)
+
+sample_cor <- getSampleCorrelation(dev)
+
+library(pheatmap)
+pheatmap(as.dist(sample_cor), 
+         annotation_row = colData(dev), 
+         clustering_distance_rows = as.dist(1-sample_cor), 
+         clustering_distance_cols = as.dist(1-sample_cor))
+
+samples <- colData(sce)$sample_id
+sample_levels <- unique(samples)
+motif_names <- rownames(motif_dev_z)
+
+# example: first two groups
+s1 <- sample_levels[4]
+s2 <- sample_levels[3]
+
+in_s1 <- samples == s1
+in_s2 <- samples == s2
+
+mean_s1 <- rowMeans(motif_dev_z[, in_s1, drop = FALSE])
+mean_s2 <- rowMeans(motif_dev_z[, in_s2, drop = FALSE])
+
+pvals_samp <- vapply(seq_along(motif_names), function(i) {
+  wilcox.test(
+    motif_dev_z[i, in_s1],
+    motif_dev_z[i, in_s2],
+    alternative = "two.sided"
+  )$p.value
+}, numeric(1))
+
+res_samples <- data.frame(
+  motif      = motif_names,
+  mean_s1    = mean_s1,
+  mean_s2    = mean_s2,
+  delta_mean = mean_s1 - mean_s2,
+  pval       = pvals_samp,
+  stringsAsFactors = FALSE
+)
+res_samples$padj <- p.adjust(res_samples$pval, method = "BH")
+
+head(res_samples[order(res_samples$padj), ], 20)
+```
+
+```{r Get top 2K bins per sample to then use them to make DA and call motifs}
+
+feature_Granges = define_feature(ref = "mm10", bin_width = 2000)
+FeatureMatrix_2K = wrapper_Signac_FeatureMatrix(file.path(maindir,"Input", "Fragments_bin"), which = feature_Granges, ref = "mm10", process_n = 30000)
+qs::qsave(FeatureMatrix_2K, file.path(maindir, "Input", "FeatureMatrix_2K.qs"))
+
+FeatureMatrix_2K = qs::qread(file.path(maindir, "Input", "FeatureMatrix_2K.qs"))
+datamatrix = FeatureMatrix_2K$datamatrix
+annot_raw = FeatureMatrix_2K$annot_raw
+
+annot_raw$sample_id = sub(".fragments","", annot_raw$sample_id)
+annot_raw$cell_id = sub(".fragments","", annot_raw$cell_id)
+
+colnames(datamatrix) = annot_raw$cell_id
+rownames(annot_raw) = annot_raw$cell_id
+
+# Load annot made previously 
+col_data = read.csv(file.path(maindir, "Output","Objects","coldata_scExp50K_all_samples.csv"), row.names = "X")
+
+############################################ For stem cells ############################################
+col_data_stemcells = col_data %>% dplyr::filter(group_id == "stem_cells")
+idx <- match(col_data_stemcells$cell_id, colnames(datamatrix))
+datamatrix_stemcells <- datamatrix[,idx]
+
+ scExp_2K = create_scExp(datamatrix_stemcells, col_data_stemcells,
+                         remove_zero_cells = TRUE,
+                         remove_zero_features = TRUE)
+  
+   plot_distribution_scExp(scExp_2K, log10 = T) 
+ 
+  scExp_2K = normalize_scExp(scExp_2K, type = "CPM")
+
+
+ #### Get rownames of top 5000 expressed bins by cluster in 2K (normalize by CPM)
+  cluster = unique(col_data_stemcells$sample_id)[1]
+  top_features = c()
+  for (cluster in unique(col_data_stemcells$sample_id)){
+    cell_vec = col_data_stemcells$cell_id[which(col_data_stemcells$sample_id == cluster)]
+    tmp.mat = normcounts(scExp_2K)[,cell_vec]
+    tmp.features = rownames(tmp.mat)[order(rowSums2(tmp.mat), decreasing = T)[1:5000]]
+    top_features = c(top_features, tmp.features)
+  }
+  top_features = unique(top_features)
+  idx <- match(top_features, rownames(datamatrix))
+
+# Subset safely, preserving sparsity
+datamatrix_stemcells <- datamatrix_stemcells[idx,]
+
+  #create sc exp object with the selected bins and do Differential analysis
+   scExp_2K = create_scExp(datamatrix_stemcells, col_data_stemcells,
+                         remove_zero_cells = TRUE,
+                         remove_zero_features = TRUE)
+   
+   
+   scExp_2K = normalize_scExp(scExp_2K, type = "CPM")
+   
+   scExp_2K = feature_annotation_scExp(scExp_2K, ref = "mm10")
+   
+    scExp_2K = find_top_features(
+        scExp_2K,
+        n = nrow(scExp_2K),
+        keep_others = FALSE)
+    
+     # scExp_2K = normalize_scExp(scExp_2K, type = "TFIDF")
+   
+  scExp_2K = reduce_dims_scExp(
+        scExp_2K, n = 20,
+        dimension_reductions = c("PCA"),
+        batch_correction = FALSE, batch_list = NULL,  
+        remove_PC = NULL,
+        verbose = FALSE)
+    
+  plot_correlation_PCA_scExp(
+        scExp_2K,
+        correlation_var = "total_counts",
+        color_by = NULL,
+        topPC = 20)
+  
+  scExp_2K = reduce_dims_scExp(
+        scExp_2K, n = 20,
+        dimension_reductions = c("PCA","UMAP"), #, "TSNE"),
+        batch_correction = FALSE, batch_list = NULL,  
+        remove_PC = NULL,
+        verbose = FALSE)
+    
+  plot_correlation_PCA_scExp(
+        scExp_2K,
+        correlation_var = "total_counts",
+        color_by = NULL,
+        topPC = 20)
+  
+   scExp_2K = ChromSCape::find_clusters_louvain_scExp(scExp_2K, resolution = 1)
+  
+  plot_reduced_dim_scExp(scExp_2K, color_by = "cell_cluster", reduced_dim = "UMAP", transparency = 0.5, size = 1, downsample = dim(scExp_2K)[2], min_quantile = 0, max_quantile = 1, annotate_clusters = F) +
+     plot_reduced_dim_scExp(scExp_2K, color_by = "sample_id", reduced_dim = "UMAP", transparency = 0.5, size = 1, downsample = dim(scExp_2K)[2], min_quantile = 0, max_quantile = 1, annotate_clusters = F)
+    plot_reduced_dim_scExp(scExp_2K, color_by = "Gm10800", reduced_dim = "UMAP", transparency = 0.5, size = 1, downsample = dim(scExp_2K)[2], min_quantile = 0, max_quantile = 1, annotate_clusters = F)
+    
+     df_plot_2K = cbind(as.data.frame(colData(scExp_2K)),as.data.frame(reducedDim(scExp_2K, "UMAP")))
+  df_plot_2K = df_plot_2K[sample(1:nrow(df_plot_2K)), ]
+  
+    pdf(file.path(maindir, "Output", "UMAP_filtered_cells_Peaks_2Kbins_stem_cells.pdf"), width = 9)
+   
+  df_plot_2K %>% ggplot(aes(x = Component_1, y = Component_2, fill = cell_cluster)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_manual(values = palette_color) + theme_void() +
+   df_plot_2K %>% ggplot(aes(x = Component_1, y = Component_2, fill = log10(total_counts))) + geom_point(shape = 21, color = "grey70", size = 3) + theme_void() + scale_fill_viridis(option = "D") +
+  df_plot_2K %>% ggplot(aes(x = Component_1, y = Component_2, fill = sample_id)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_brewer(palette = "Set3") + theme_void() + 
+      df_plot_2K %>% ggplot(aes(x = Component_1, y = Component_2, fill = group_id)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_brewer(palette = "Set3") + theme_void()
+  
+  dev.off()
+  
+   
+   ### differential analysis ###
+  
+  ## CD62L-_stem_cells_Drug_vs_No_Drug 
+   scExp_2K_da = differential_analysis_scExp(scExp_2K, de_type = "custom", by = c("sample_id", "sample_id"),group = data.frame(group = c("CD62L-_stem_cells_with_drug_tagged")), ref = data.frame(ref = c("CD62L-_stem_cells_no_drug_tagged")), prioritize_genes = F, method = "wilcox")
+    DA = as.data.frame(rowData(scExp_2K_da))
+    DA = DA %>% mutate(status = case_when(qval.group > 0.05 ~ "Not Sig",
+                                                    abs(logFC.group) < 0.5 ~ "Not Sig",
+                                        qval.group < 0.05 & logFC.group < -0.5 ~ "Down",
+                                        qval.group < 0.05 & logFC.group > 0.5 ~ "Up"))
+    
+    pdf(file.path(maindir, "Output", "Volcano_CD62L-_stem_cells_Drug_vs_No_Drug_2Kbins.pdf"), width = 9)
+    DA %>%
+  ggplot(aes(x = logFC.group, y = -log10(qval.group), fill = status)) + 
+  geom_point(size = 4, alpha = 0.4, shape = 21, color = "black") +   
+  geom_hline(yintercept = -log10(0.05), linetype="dashed") + 
+  geom_vline(xintercept = 0.5, linetype="dashed") +
+   geom_vline(xintercept = -0.5, linetype="dashed") +
+  theme_classic() +
+  scale_fill_manual(values = c("lightskyblue", "grey50", "tomato")) +
+  ggrepel::geom_text_repel(data = dplyr::filter(DA, -log10(qval.group) > 1.30103), aes(label = Gene), max.overlaps = 20, color = "black", size = 5) + 
+    ggtitle("Volcano Plot - CD62L-_stem_cells - Drug vs No Drug")
+    dev.off()
+    
+    write.csv(DA, file.path(maindir, "Output","Objects","DA_CD62L-_stem_cells_Drug_vs_No_Drug_2Kbins.csv"), row.names = F)
+    
+     ## CD62L+_stem_cells_Drug_vs_No_Drug 
+   scExp_2K_da = differential_analysis_scExp(scExp_2K, de_type = "custom", by = c("sample_id", "sample_id"),group = data.frame(group = c("CD62L+_stem_cells_with_drug_tagged")), ref = data.frame(ref = c("CD62L+_stem_cells_no_drug_tagged")), prioritize_genes = F, method = "wilcox")
+    DA = as.data.frame(rowData(scExp_2K_da))
+    DA = DA %>% mutate(status = case_when(qval.group > 0.05 ~ "Not Sig",
+                                                    abs(logFC.group) < 0.5 ~ "Not Sig",
+                                        qval.group < 0.05 & logFC.group < -0.5 ~ "Down",
+                                        qval.group < 0.05 & logFC.group > 0.5 ~ "Up"))
+    pdf(file.path(maindir, "Output", "Volcano_CD62L+_stem_cells_Drug_vs_No_Drug_2Kbins.pdf"), width = 9)
+    DA %>%
+  ggplot(aes(x = logFC.group, y = -log10(qval.group), fill = status)) + 
+  geom_point(size = 4, alpha = 0.4, shape = 21, color = "black") +   
+  geom_hline(yintercept = -log10(0.05), linetype="dashed") + 
+  geom_vline(xintercept = 0.5, linetype="dashed") +
+   geom_vline(xintercept = -0.5, linetype="dashed") +
+  theme_classic() +
+  scale_fill_manual(values = c("lightskyblue", "grey50", "tomato")) +
+  ggrepel::geom_text_repel(data = dplyr::filter(DA, -log10(qval.group) > 1.30103), aes(label = Gene), max.overlaps = 20, color = "black", size = 5) + 
+    ggtitle("Volcano Plot - CD62L+_stem_cells - Drug vs No Drug")
+    dev.off()
+    
+    write.csv(DA, file.path(maindir, "Output","Objects","DA_CD62L+_stem_cells_Drug_vs_No_Drug_2Kbins.csv"), row.names = F)
+    
+
+############################################ For Mouse ############################################
+col_data_mouse = col_data %>% dplyr::filter(group_id == "mouse")
+idx <- match(col_data_mouse$cell_id, colnames(datamatrix))
+datamatrix_mouse <- datamatrix[,idx]
+
+ scExp_2K = create_scExp(datamatrix_mouse, col_data_mouse,
+                         remove_zero_cells = TRUE,
+                         remove_zero_features = TRUE)
+  
+   plot_distribution_scExp(scExp_2K, log10 = T) 
+ 
+  scExp_2K = normalize_scExp(scExp_2K, type = "CPM")
+
+
+ #### Get rownames of top 5000 expressed bins by cluster in 2K (normalize by CPM)
+  cluster = unique(col_data_mouse$sample_id)[1]
+  top_features = c()
+  for (cluster in unique(col_data_mouse$sample_id)){
+    cell_vec = col_data_mouse$cell_id[which(col_data_mouse$sample_id == cluster)]
+    tmp.mat = normcounts(scExp_2K)[,cell_vec]
+    tmp.features = rownames(tmp.mat)[order(rowSums2(tmp.mat), decreasing = T)[1:5000]]
+    top_features = c(top_features, tmp.features)
+  }
+  top_features = unique(top_features)
+  idx <- match(top_features, rownames(datamatrix))
+
+# Subset safely, preserving sparsity
+datamatrix_mouse <- datamatrix_mouse[idx,]
+
+  #create sc exp object with the selected bins and do Differential analysis
+   scExp_2K = create_scExp(datamatrix_mouse, col_data_mouse,
+                         remove_zero_cells = TRUE,
+                         remove_zero_features = TRUE)
+   
+   
+   scExp_2K = normalize_scExp(scExp_2K, type = "CPM")
+   
+   scExp_2K = feature_annotation_scExp(scExp_2K, ref = "mm10")
+   
+    scExp_2K = find_top_features(
+        scExp_2K,
+        n = nrow(scExp_2K),
+        keep_others = FALSE)
+    
+     # scExp_2K = normalize_scExp(scExp_2K, type = "TFIDF")
+   
+  scExp_2K = reduce_dims_scExp(
+        scExp_2K, n = 20,
+        dimension_reductions = c("PCA"),
+        batch_correction = FALSE, batch_list = NULL,  
+        remove_PC = NULL,
+        verbose = FALSE)
+    
+  plot_correlation_PCA_scExp(
+        scExp_2K,
+        correlation_var = "total_counts",
+        color_by = NULL,
+        topPC = 20)
+  
+  scExp_2K = reduce_dims_scExp(
+        scExp_2K, n = 20,
+        dimension_reductions = c("PCA","UMAP"), #, "TSNE"),
+        batch_correction = FALSE, batch_list = NULL,  
+        remove_PC = NULL,
+        verbose = FALSE)
+    
+  plot_correlation_PCA_scExp(
+        scExp_2K,
+        correlation_var = "total_counts",
+        color_by = NULL,
+        topPC = 20)
+  
+   scExp_2K = ChromSCape::find_clusters_louvain_scExp(scExp_2K, resolution = 1)
+  
+  plot_reduced_dim_scExp(scExp_2K, color_by = "cell_cluster", reduced_dim = "UMAP", transparency = 0.5, size = 1, downsample = dim(scExp_2K)[2], min_quantile = 0, max_quantile = 1, annotate_clusters = F) +
+     plot_reduced_dim_scExp(scExp_2K, color_by = "sample_id", reduced_dim = "UMAP", transparency = 0.5, size = 1, downsample = dim(scExp_2K)[2], min_quantile = 0, max_quantile = 1, annotate_clusters = F)
+    
+     df_plot_2K = cbind(as.data.frame(colData(scExp_2K)),as.data.frame(reducedDim(scExp_2K, "UMAP")))
+  df_plot_2K = df_plot_2K[sample(1:nrow(df_plot_2K)), ]
+  
+    pdf(file.path(maindir, "Output", "UMAP_filtered_cells_Peaks_2Kbins_mouse.pdf"), width = 9)
+   
+  df_plot_2K %>% ggplot(aes(x = Component_1, y = Component_2, fill = cell_cluster)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_manual(values = palette_color) + theme_void() +
+   df_plot_2K %>% ggplot(aes(x = Component_1, y = Component_2, fill = log10(total_counts))) + geom_point(shape = 21, color = "grey70", size = 3) + theme_void() + scale_fill_viridis(option = "D") +
+  df_plot_2K %>% ggplot(aes(x = Component_1, y = Component_2, fill = sample_id)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_brewer(palette = "Set3") + theme_void() + 
+      df_plot_2K %>% ggplot(aes(x = Component_1, y = Component_2, fill = group_id)) + geom_point(shape = 21, color = "grey70", size = 3) + scale_fill_brewer(palette = "Set3") + theme_void()
+  
+  dev.off()
+  
+   
+   ### differential analysis ###
+  
+  ## Mouse_62neg_Tg_vs_WT
+   scExp_2K_da = differential_analysis_scExp(scExp_2K, de_type = "custom", by = c("sample_id", "sample_id"),group = data.frame(group = c("m64_m68_Tg_62neg_tagged")), ref = data.frame(ref = c("m61_m66_WT_62neg_tagged")), prioritize_genes = F, method = "wilcox")
+    DA = as.data.frame(rowData(scExp_2K_da))
+    DA = DA %>% mutate(status = case_when(qval.group > 0.05 ~ "Not Sig",
+                                                    abs(logFC.group) < 0.5 ~ "Not Sig",
+                                        qval.group < 0.05 & logFC.group < -0.5 ~ "Down",
+                                        qval.group < 0.05 & logFC.group > 0.5 ~ "Up"))
+    pdf(file.path(maindir, "Output", "Volcano_Mouse_62neg_Tg_vs_WT_2Kbins.pdf"), width = 9)
+    DA %>%
+  ggplot(aes(x = logFC.group, y = -log10(qval.group), fill = status)) + 
+  geom_point(size = 4, alpha = 0.4, shape = 21, color = "black") +   
+  geom_hline(yintercept = -log10(0.05), linetype="dashed") + 
+  geom_vline(xintercept = 0.5, linetype="dashed") +
+   geom_vline(xintercept = -0.5, linetype="dashed") +
+  theme_classic() +
+  scale_fill_manual(values = c("lightskyblue", "grey50", "tomato")) +
+  ggrepel::geom_text_repel(data = dplyr::filter(DA, -log10(qval.group) > 1.30103), aes(label = Gene), max.overlaps = 20, color = "black", size = 5) + 
+    ggtitle("Volcano Plot - Mouse 62 neg - Tg vs WT")
+    dev.off()
+    
+    write.csv(DA, file.path(maindir, "Output","Objects","DA_Mouse_62neg_Tg_vs_WT_2Kbins.csv"), row.names = F)
+    
+    ## Mouse_62hi_Tg_vs_WT
+     scExp_2K_da = differential_analysis_scExp(scExp_2K, de_type = "custom", by = c("sample_id", "sample_id"),group = data.frame(group = c("m64_m68_Tg_62hi_tagged")), ref = data.frame(ref = c("m61_m66_WT_62hi_tagged")), prioritize_genes = F, method = "wilcox")
+      DA = as.data.frame(rowData(scExp_2K_da))
+      DA = DA %>% mutate(status = case_when(qval.group > 0.05 ~ "Not Sig",
+                                                      abs(logFC.group) < 0.5 ~ "Not Sig",
+                                          qval.group < 0.05 & logFC.group < -0.5 ~ "Down",
+                                          qval.group < 0.05 & logFC.group > 0.5 ~ "Up"))
+      pdf(file.path(maindir, "Output", "Volcano_Mouse_62hi_Tg_vs_WT_2Kbins.pdf"), width = 9)
+      DA %>%
+    ggplot(aes(x = logFC.group, y = -log10(qval.group), fill = status)) + 
+    geom_point(size = 4, alpha = 0.4, shape = 21, color = "black") +   
+    geom_hline(yintercept = -log10(0.05), linetype="dashed") + 
+    geom_vline(xintercept = 0.5, linetype="dashed") +
+     geom_vline(xintercept = -0.5, linetype="dashed") +
+    theme_classic() +
+    scale_fill_manual(values = c("lightskyblue", "grey50", "tomato")) +
+    ggrepel::geom_text_repel(data = dplyr::filter(DA, -log10(qval.group) > 1.30103), aes(label = Gene), max.overlaps = 20, color = "black", size = 5) + 
+      ggtitle("Volcano Plot - Mouse 62 high - Tg vs WT")
+      dev.off()
+      
+      write.csv(DA, file.path(maindir, "Output","Objects","DA_Mouse_62high_Tg_vs_WT_2Kbins.csv"), row.names = F)
+    
+
+############################################  TF ANALYSIS ##################
+    
+   
+   ####  Cell Line ###
+      #### CD62L - ###
+      
+   DA = read.csv(file.path(maindir, "Output","Objects","DA_CD62L-_stem_cells_Drug_vs_No_Drug_2Kbins.csv"))
+    DA <- DA %>%
+  mutate(seqnames = gsub("(chr.*)_(.*)_(.*)", "\\1",ID),
+         start = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\2",ID)), 
+         end = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\3",ID)))
+
+#Motif Enrichment 
+mm.genome = BSgenome.Mmusculus.UCSC.mm10::BSgenome.Mmusculus.UCSC.mm10
+meme_db = read_meme(file.path(maindir, "Annotations", "HOCOMOCOv11_core_MOUSE_mono_meme_format.meme")) %>% to_df()
+# meme_db = read_meme(file.path(maindir, "Annotations", "H13CORE_meme_format.meme")) %>% to_df()
+meme_db = to_list(meme_db)
+
+meme_db_jaspar = list()
+file = list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))[1]
+
+for (file in list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))){
+  jaspar_to_add = read_meme(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme", file))
+  meme_db_jaspar = c(meme_db_jaspar, jaspar_to_add)
+}
+meme_db_jaspar = meme_db_jaspar %>%
+  to_df() %>%
+  mutate(name = paste0(altname, "_", name)) %>%
+  to_list()
+    
+Motif_diff_UP = DA %>% dplyr::filter(logFC.group > 0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Motif_diff_UP = DA %>% mutate(t_val = logFC.group*(-log10(qval.group))) %>% slice_max(t_val, n = 100) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Motif_diff_Down = DA %>% dplyr::filter(logFC.group < -0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Motif_diff_Down = DA %>% mutate(t_val = logFC.group*(-log10(qval.group))) %>%  slice_min(t_val, n = 100) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Background = DA %>% dplyr::filter(abs(logFC.group) < 0.5) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique() %>% sample(size = (10*length(Motif_diff_Down)))
+
+AME_LP_HS1 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS1)
+AME_LP_HS2 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db)
+head(AME_LP_HS2)
+AME_LP_HS3 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS3)
+AME_LP_HS4 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db)
+head(AME_LP_HS4)
+                                                                    ## Motif detected only in AME 3 ##
+
+    pdf(file.path(maindir, "Output", "Motif_Enrichment_CD62L-_stem_cells_Drug_vs_No_Drug_2Kbins.pdf"), width = 9)
+# AME_LP_HS1 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS1, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Cell line CD62 L- - Drug vs WT \n - UPregulated peaks - Jaspar database")
+# 
+# AME_LP_HS2 = AME_LP_HS2 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id)) 
+# AME_LP_HS2 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS2, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Cell line CD62 L- - Drug vs WT \n - UPregulated peaks - Hocomoco database")
+# 
+AME_LP_HS3 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS3, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Cell line CD62 L- - Drug vs WT \n - Downregulated peaks - Jaspar database")
+# 
+# AME_LP_HS4 = AME_LP_HS4 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id)) 
+# AME_LP_HS4 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS4, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Cell line CD62 L- - Drug vs WT \n - Downregulated peaks - Hocomoco database")
+   dev.off()
+   
+    # write.csv(AME_LP_HS1, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L-_stem_cells_Drug_vs_No_Drug_2Kbins_Upregulated_peaks_JASPAR.csv"), row.names = F)
+    # write.csv(AME_LP_HS2, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L-_stem_cells_Drug_vs_No_Drug_2Kbins_Upregulated_peaks_HOCOMOCO.csv"), row.names = F)
+        write.csv(AME_LP_HS3, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L-_stem_cells_Drug_vs_No_Drug_2Kbins_Downregulated_peaks_JASPAR.csv"), row.names = F)
+    # write.csv(AME_LP_HS4, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L-_stem_cells_Drug_vs_No_Drug_2Kbins_Downregulated_peaks_HOCOMOCO.csv"), row.names = F)
+
+            #### CD62L + ###
+      
+   DA = read.csv(file.path(maindir, "Output","Objects","DA_CD62L+_stem_cells_Drug_vs_No_Drug_2Kbins.csv"))
+    DA <- DA %>%
+  mutate(seqnames = gsub("(chr.*)_(.*)_(.*)", "\\1",ID),
+         start = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\2",ID)), 
+         end = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\3",ID)))
+
+#Motif Enrichment 
+mm.genome = BSgenome.Mmusculus.UCSC.mm10::BSgenome.Mmusculus.UCSC.mm10
+meme_db = read_meme(file.path(maindir, "Annotations", "HOCOMOCOv11_core_MOUSE_mono_meme_format.meme")) %>% to_df()
+# meme_db = read_meme(file.path(maindir, "Annotations", "H13CORE_meme_format.meme")) %>% to_df()
+meme_db = to_list(meme_db)
+
+meme_db_jaspar = list()
+file = list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))[1]
+
+for (file in list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))){
+  jaspar_to_add = read_meme(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme", file))
+  meme_db_jaspar = c(meme_db_jaspar, jaspar_to_add)
+}
+meme_db_jaspar = meme_db_jaspar %>%
+  to_df() %>%
+  mutate(name = paste0(altname, "_", name)) %>%
+  to_list()
+    
+Motif_diff_UP = DA %>% dplyr::filter(logFC.group > 0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Motif_diff_Down = DA %>% dplyr::filter(logFC.group < -0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Background = DA %>% dplyr::filter(abs(logFC.group) < 0.1) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique() 
+
+AME_LP_HS1 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS1)
+AME_LP_HS2 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db)
+head(AME_LP_HS2)
+AME_LP_HS3 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS3)
+AME_LP_HS4 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db)
+head(AME_LP_HS4)
+                                                                    ## Motif detected only in AME 3 ##
+
+#     pdf(file.path(maindir, "Output", "Motif_Enrichment_CD62L+_stem_cells_Drug_vs_No_Drug_2Kbins.pdf"), width = 9)
+# AME_LP_HS1 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS1, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Cell line CD62 L+ - Drug vs WT \n - UPregulated peaks - Jaspar database")
+# 
+# AME_LP_HS2 = AME_LP_HS2 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id)) 
+# AME_LP_HS2 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS2, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Cell line CD62 L+ - Drug vs WT \n - UPregulated peaks - Hocomoco database")
+# 
+# AME_LP_HS3 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS3, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Cell line CD62 L+ - Drug vs WT \n - Downregulated peaks - Jaspar database")
+# 
+# AME_LP_HS4 = AME_LP_HS4 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id)) 
+# AME_LP_HS4 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS4, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Cell line CD62 L+ - Drug vs WT \n - Downregulated peaks - Hocomoco database")
+#    dev.off()
+   
+    # write.csv(AME_LP_HS1, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L+_stem_cells_Drug_vs_No_Drug_2Kbins_Upregulated_peaks_JASPAR.csv"), row.names = F)
+    # write.csv(AME_LP_HS2, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L+_stem_cells_Drug_vs_No_Drug_2Kbins_Upregulated_peaks_HOCOMOCO.csv"), row.names = F)
+    # write.csv(AME_LP_HS3, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L+_stem_cells_Drug_vs_No_Drug_2Kbins_Downregulated_peaks_JASPAR.csv"), row.names = F)
+    # write.csv(AME_LP_HS4, file.path(maindir, "Output","Objects","Motif_Enrichment_CD62L+_stem_cells_Drug_vs_No_Drug_2Kbins_Downregulated_peaks_HOCOMOCO.csv"), row.names = F)
+
+############################################# Mouse ##
+   #### 62 neg ###
+      
+   DA = read.csv(file.path(maindir, "Output","Objects","DA_Mouse_62neg_Tg_vs_WT_2Kbins.csv"))
+    DA <- DA %>%
+  mutate(seqnames = gsub("(chr.*)_(.*)_(.*)", "\\1",ID),
+         start = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\2",ID)), 
+         end = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\3",ID)))
+
+#Motif Enrichment 
+mm.genome = BSgenome.Mmusculus.UCSC.mm10::BSgenome.Mmusculus.UCSC.mm10
+meme_db = read_meme(file.path(maindir, "Annotations", "HOCOMOCOv11_core_MOUSE_mono_meme_format.meme")) %>% to_df()
+# meme_db = read_meme(file.path(maindir, "Annotations", "H13CORE_meme_format.meme")) %>% to_df()
+meme_db = to_list(meme_db)
+
+meme_db_jaspar = list()
+file = list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))[1]
+
+for (file in list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))){
+  jaspar_to_add = read_meme(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme", file))
+  meme_db_jaspar = c(meme_db_jaspar, jaspar_to_add)
+}
+meme_db_jaspar = meme_db_jaspar %>%
+  to_df() %>%
+  mutate(name = paste0(altname, "_", name)) %>%
+  to_list()
+    
+Motif_diff_UP = DA %>% dplyr::filter(logFC.group > 0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Motif_diff_Down = DA %>% dplyr::filter(logFC.group < -0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Background = DA %>% dplyr::filter(abs(logFC.group) < 0.1) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique() 
+
+AME_LP_HS1 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS1)
+AME_LP_HS2 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db)
+head(AME_LP_HS2)
+AME_LP_HS3 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS3)
+AME_LP_HS4 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db)
+head(AME_LP_HS4)
+                                                                    ## Motif detected only in AME 4 ##
+
+    pdf(file.path(maindir, "Output", "Motif_Enrichment_Mouse_62neg_Tg_vs_WT_2Kbins.pdf"), width = 9)
+# AME_LP_HS1 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS1, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Mouse_62neg_Tg_vs_WT \n - UPregulated peaks - Jaspar database")
+# 
+# AME_LP_HS2 = AME_LP_HS2 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id)) 
+# AME_LP_HS2 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS2, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Mouse_62neg_Tg_vs_WT \n - UPregulated peaks - Hocomoco database")
+# 
+# AME_LP_HS3 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS3, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+#     ggtitle("Motif Enrichment - Mouse_62neg_Tg_vs_WT \n - Downregulated peaks - Jaspar database")
+# 
+AME_LP_HS4 = AME_LP_HS4 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id))
+AME_LP_HS4 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS4, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Mouse_62neg_Tg_vs_WT \n - Downregulated peaks - Hocomoco database")
+   dev.off()
+   
+    # write.csv(AME_LP_HS1, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62neg_Tg_vs_WT_2Kbins_Upregulated_peaks_JASPAR.csv"), row.names = F)
+    # write.csv(AME_LP_HS2, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62neg_Tg_vs_WT_2Kbins_Upregulated_peaks_HOCOMOCO.csv"), row.names = F)
+        # write.csv(AME_LP_HS3, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62neg_Tg_vs_WT_2Kbins_Downregulated_peaks_JASPAR.csv"), row.names = F)
+    write.csv(AME_LP_HS4, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62neg_Tg_vs_WT_2Kbins_Downregulated_peaks_HOCOMOCO.csv"), row.names = F)
+
+           #### 62 high ###
+      
+   DA = read.csv(file.path(maindir, "Output","Objects","DA_Mouse_62high_Tg_vs_WT_2Kbins.csv"))
+    DA <- DA %>%
+  mutate(seqnames = gsub("(chr.*)_(.*)_(.*)", "\\1",ID),
+         start = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\2",ID)), 
+         end = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\3",ID)))
+
+#Motif Enrichment 
+mm.genome = BSgenome.Mmusculus.UCSC.mm10::BSgenome.Mmusculus.UCSC.mm10
+meme_db = read_meme(file.path(maindir, "Annotations", "HOCOMOCOv11_core_MOUSE_mono_meme_format.meme")) %>% to_df()
+# meme_db = read_meme(file.path(maindir, "Annotations", "H13CORE_meme_format.meme")) %>% to_df()
+meme_db = to_list(meme_db)
+
+meme_db_jaspar = list()
+file = list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))[1]
+
+for (file in list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))){
+  jaspar_to_add = read_meme(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme", file))
+  meme_db_jaspar = c(meme_db_jaspar, jaspar_to_add)
+}
+meme_db_jaspar = meme_db_jaspar %>%
+  to_df() %>%
+  mutate(name = paste0(altname, "_", name)) %>%
+  to_list()
+    
+# Motif_diff_UP = DA %>% dplyr::filter(logFC.group > 0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Motif_diff_Down = DA %>% dplyr::filter(logFC.group < -0.5 & qval.group < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Background = DA %>% dplyr::filter(abs(logFC.group) < 0.1) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique() 
+
+# AME_LP_HS1 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db_jaspar)
+# head(AME_LP_HS1)
+# AME_LP_HS2 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db)
+# head(AME_LP_HS2)
+AME_LP_HS3 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS3)
+AME_LP_HS4 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db)
+head(AME_LP_HS4)
+                                                                    ## Motif detected only in AME 3 & 4 ##
+
+    pdf(file.path(maindir, "Output", "Motif_Enrichment_Mouse_62high_Tg_vs_WT_2Kbins.pdf"), width = 9)
+# AME_LP_HS1 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS1, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Mouse_62high_Tg_vs_WT \n - UPregulated peaks - Jaspar database")
+# 
+# AME_LP_HS2 = AME_LP_HS2 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id)) 
+# AME_LP_HS2 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS2, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) + 
+#     ggtitle("Motif Enrichment - Mouse_62high_Tg_vs_WT \n - UPregulated peaks - Hocomoco database")
+# 
+AME_LP_HS3 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS3, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Mouse_62high_Tg_vs_WT \n - Downregulated peaks - Jaspar database")
+
+AME_LP_HS4 = AME_LP_HS4 %>% mutate(motif_alt_id = gsub("(.*)_MOUSE.*", "\\1",motif_id))
+AME_LP_HS4 %>% ggplot(aes(y = log10(adj.pvalue), x = rank)) + geom_point() + theme_bw() + ggrepel::geom_text_repel(data = dplyr::filter(AME_LP_HS4, rank < 10), aes(label = motif_alt_id), max.overlaps = 20, color = "black", size = 5) +
+    ggtitle("Motif Enrichment - Mouse_62high_Tg_vs_WT \n - Downregulated peaks - Hocomoco database")
+   dev.off()
+   
+    # write.csv(AME_LP_HS1, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62high_Tg_vs_WT_2Kbins_Upregulated_peaks_JASPAR.csv"), row.names = F)
+    # write.csv(AME_LP_HS2, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62high_Tg_vs_WT_2Kbins_Upregulated_peaks_HOCOMOCO.csv"), row.names = F)
+        write.csv(AME_LP_HS3, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62high_Tg_vs_WT_2Kbins_Downregulated_peaks_JASPAR.csv"), row.names = F)
+    write.csv(AME_LP_HS4, file.path(maindir, "Output","Objects","Motif_Enrichment_Mouse_62high_Tg_vs_WT_2Kbins_Downregulated_peaks_HOCOMOCO.csv"), row.names = F)
+    
+```
+
+```{r test of new DA methods}
+library(SingleCellExperiment)
+library(DESeq2)
+library(stringr)
+
+cts <- assay(scExp_1K, "counts")  # peaks x cells
+
+# Build per-cell metadata
+meta <- as.data.frame(colData(scExp_1K))
+meta$cell <- colnames(scExp_1K)
+
+# CD62L label -> CD62Lneg / CD62Lpos
+meta$CD62L <- ifelse(grepl("^CD62L\\+", meta$sample_id), "CD62Lpos",
+              ifelse(grepl("^CD62L-",  meta$sample_id), "CD62Lneg", NA))
+
+# drug label
+meta$drug <- ifelse(grepl("with_drug", meta$sample_id), "with_drug",
+             ifelse(grepl("no_drug",   meta$sample_id), "no_drug", NA))
+
+# optional: block by library/replicate extracted from cell name
+# (adjust the regex if your naming differs)
+meta$replicate <- str_extract(meta$cell, "SCC-scChIC-CUR-PER-\\d+")
+
+stopifnot(!any(is.na(meta$CD62L)), !any(is.na(meta$drug)))
+meta$CD62L <- factor(meta$CD62L, levels = c("CD62Lneg","CD62Lpos"))
+meta$drug  <- factor(meta$drug,  levels = c("no_drug","with_drug"))
+meta$replicate <- factor(meta$replicate)  # may contain NAs; that's OK if you drop/replace below
+
+# Helper to run DESeq2 within a CD62L group
+run_deseq_within_cd62l <- function(cd62l_level, block_replicate = TRUE) {
+  keep <- meta$CD62L == cd62l_level
+  cts_sub <- cts[, keep, drop = FALSE]
+  meta_sub <- meta[keep, , drop = FALSE]
+
+  # DESeq2 requires no NA in design variables
+  if (block_replicate) {
+    ok <- !is.na(meta_sub$replicate)
+    cts_sub <- cts_sub[, ok, drop = FALSE]
+    meta_sub <- meta_sub[ok, , drop = FALSE]
+  }
+
+  # Make DESeq2 colData with rownames matching columns of counts
+  coldata <- data.frame(
+    row.names  = colnames(cts_sub),
+    drug       = droplevels(meta_sub$drug),
+    replicate  = if (block_replicate) droplevels(meta_sub$replicate) else NULL
+  )
+
+  design_formula <- if (block_replicate) ~ replicate + drug else ~ drug
+
+  dds <- DESeqDataSetFromMatrix(
+    countData = round(as.matrix(cts_sub)),  # ensure integer
+    colData   = coldata,
+    design    = design_formula
+  )
+
+  dds <- DESeq(dds)
+
+  res <- results(dds, contrast = c("drug", "with_drug", "no_drug"))
+  res <- res[order(res$padj), ]
+  return(res)
+}
+
+# 1) drug vs no_drug within CD62Lneg
+res_CD62Lneg_drug <- run_deseq_within_cd62l("CD62Lneg", block_replicate = F)
+
+# 2) drug vs no_drug within CD62Lpos
+res_CD62Lpos_drug <- run_deseq_within_cd62l("CD62Lpos", block_replicate = TRUE)
+
+head(res_CD62Lneg_drug)
+head(res_CD62Lpos_drug)
+
+library(edgeR)
+
+# example: cells-as-replicates within CD62Lneg (not ideal statistically, but runs)
+keep <- meta$CD62L == "CD62Lneg"
+keep <- meta$CD62L == "CD62Lpos"
+y <- DGEList(counts = as.matrix(cts[, keep]))
+group <- droplevels(meta$drug[keep])   # no_drug vs with_drug
+design <- model.matrix(~ group)
+
+y <- calcNormFactors(y)
+y <- estimateDisp(y, design)
+fit <- glmQLFit(y, design)
+res <- glmQLFTest(fit, coef = 2)  # drug effect
+topTags(res)
+diff_express = as.data.frame(topTags(res, n = nrow(cts)))
+
+
+DA = diff_express
+DA$ID = rownames(DA)
+
+ DA = DA %>% mutate(status = case_when(FDR > 0.05 ~ "Not Sig",
+                                                    abs(logFC) < 0.5 ~ "Not Sig",
+                                        FDR < 0.05 & logFC < -0.5 ~ "Down",
+                                        FDR < 0.05 & logFC > 0.5 ~ "Up"))
+    DA %>%
+  ggplot(aes(x = logFC, y = -log10(FDR), fill = status)) + 
+  geom_point(size = 4, alpha = 0.4, shape = 21, color = "black") +   
+  geom_hline(yintercept = -log10(0.05), linetype="dashed") + 
+  geom_vline(xintercept = 0.5, linetype="dashed") +
+   geom_vline(xintercept = -0.5, linetype="dashed") +
+  theme_classic() +
+  scale_fill_manual(values = c("lightskyblue", "grey50", "tomato"))
+
+    DA <- DA %>%
+  mutate(seqnames = gsub("(chr.*)_(.*)_(.*)", "\\1",ID),
+         start = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\2",ID)), 
+         end = as.numeric(gsub("(chr.*)_(.*)_(.*)", "\\3",ID)))
+
+#Motif Enrichment 
+mm.genome = BSgenome.Mmusculus.UCSC.mm10::BSgenome.Mmusculus.UCSC.mm10
+meme_db = read_meme(file.path(maindir, "Annotations", "HOCOMOCOv11_core_MOUSE_mono_meme_format.meme")) %>% to_df()
+# meme_db = read_meme(file.path(maindir, "Annotations", "H13CORE_meme_format.meme")) %>% to_df()
+meme_db = to_list(meme_db)
+
+meme_db_jaspar = list()
+file = list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))[1]
+
+for (file in list.files(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme"))){
+  jaspar_to_add = read_meme(file.path(maindir, "Annotations", "JASPAR2022_CORE_vertebrates_non-redundant_pfms_meme", file))
+  meme_db_jaspar = c(meme_db_jaspar, jaspar_to_add)
+}
+meme_db_jaspar = meme_db_jaspar %>%
+  to_df() %>%
+  mutate(name = paste0(altname, "_", name)) %>%
+  to_list()
+    
+Motif_diff_UP = DA %>% dplyr::filter(logFC > 0.5 & FDR < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+# Motif_diff_UP = DA %>% slice_max(logFC.group, n = 100) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Motif_diff_Down = DA %>% dplyr::filter(logFC < -0.5 & FDR < 0.05) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+# Motif_diff_Down = DA %>% slice_min(logFC.group, n = 100) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique()
+Background = DA %>% dplyr::filter(abs(logFC) < 0.2) %>% plyranges::as_granges() %>% memes::get_sequence(mm.genome) %>% unique() %>% sample(size = (10*length(Motif_diff_UP)))
+
+AME_LP_HS1 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS1)
+AME_LP_HS2 = memes::runAme(Motif_diff_UP,control = Background, database = meme_db)
+head(AME_LP_HS2)
+AME_LP_HS3 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db_jaspar)
+head(AME_LP_HS3)
+AME_LP_HS4 = memes::runAme(Motif_diff_Down,control = Background, database = meme_db)
+head(AME_LP_HS4)
+
+
+devtools::install_github("neurorestore/Libra")
+install.packages("~/Downloads/Libra-main.zip", repos = NULL, type = "source")
+# unzip to a folder
+unzip("~/Downloads/Libra-main.zip", exdir = "~/Downloads")
+
+# install from the extracted directory
+remotes::install_deps("~/Downloads/Libra-main", dependencies = TRUE)
+install.packages("~/Downloads/Libra-main", repos = NULL, type = "source")
+library(Libra)
+DE = Libra::run_de(scExp_1K, cell_type_col = "cell_id", label_col = "sample_id", input_type = "scATAC")
+scExp_1K_CD62Lpos = scExp_1K[,scExp_1K$sample_id %in% c("CD62L+_stem_cells_no_drug_tagged","CD62L+_stem_cells_with_drug_tagged")]
+scExp_1K_CD62Lpos
+scExp_1K_CD62Lpos$cell_type = "stem_cells"
+scExp_1K_CD62Lpos$replicate = "rep1"
+colnames(colData(scExp_1K_CD62Lpos))
+
+DE = Libra::run_de(scExp_1K_CD62Lpos,
+                   cell_type_col = "cell_type", 
+                   label_col = "sample_id", 
+                   replicate_col = "replicate", 
+                   de_family="singlecell",
+                   de_method="wilcox", 
+                   input_type = "scATAC")
+
+DE = Libra::run_de(scExp_1K_CD62Lpos,
+                   cell_type_col = "cell_type", 
+                   label_col = "sample_id", 
+                   replicate_col = "replicate", 
+                   de_family="singlecell",
+                   de_method="t", 
+                   input_type = "scATAC")
+
+DE = Libra::run_de(scExp_1K_CD62Lpos,
+                   cell_type_col = "cell_type", 
+                   label_col = "sample_id", 
+                   replicate_col = "replicate", 
+                   de_family="singlecell",
+                   de_method="negbinom", 
+                   input_type = "scATAC")
+
+DE = Libra::run_de(scExp_1K_CD62Lpos,
+                   cell_type_col = "cell_type", 
+                   label_col = "sample_id", 
+                   replicate_col = "replicate", 
+                   de_family="singlecell",
+                   de_method="LR", 
+                   input_type = "scATAC")
+
+DE = Libra::run_de(scExp_1K_CD62Lpos,
+                   cell_type_col = "cell_type", 
+                   label_col = "sample_id", 
+                   replicate_col = "replicate", 
+                   de_family="singlecell",
+                   de_method="LR", 
+                   input_type = "scATAC")
+
+DE = Libra::run_de(scExp_1K_CD62Lpos,
+                   cell_type_col = "cell_type", 
+                   label_col = "sample_id", 
+                   replicate_col = "replicate", 
+                   de_family="singlecell",
+                   de_method="fisher", 
+                   input_type = "scATAC")
+
+DE = Libra::run_de(scExp_1K_CD62Lpos,
+                   cell_type_col = "cell_type", 
+                   label_col = "sample_id", 
+                   replicate_col = "replicate", 
+                   de_family="singlecell",
+                   de_method="binomial", 
+                   input_type = "scATAC")
+
+DE = Libra::run_de(scExp_1K_CD62Lpos,
+                   cell_type_col = "cell_type", 
+                   label_col = "sample_id", 
+                   replicate_col = "replicate", 
+                   de_family="singlecell",
+                   de_method="LR_peaks", 
+                   input_type = "scATAC")
+
+DE = Libra::run_de(scExp_1K_CD62Lpos,
+                   cell_type_col = "cell_type", 
+                   label_col = "sample_id", 
+                   replicate_col = "replicate", 
+                   de_family="singlecell",
+                   de_method="permutation", 
+                   input_type = "scATAC")
+```

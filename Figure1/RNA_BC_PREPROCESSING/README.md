@@ -3,7 +3,7 @@
 
 This is the code to extract and analyse VDJ DRAG barcodes from 10x single cell RNA-seq data as used in the paper:
 
-Metabolic Heterogeneity in Hematopoietic Multipotent Progenitors Fuels Innate Immune Cell Production (Cosgrove et al., 2022).
+Cosgrove et al. The pentose phosphate pathway modulates myelo-lymphoid lineage specification. *Nature Communications* (2026). (Preprint: "Metabolic priming of multipotent hematopoietic progenitors fuels innate immunity", bioRxiv.)
 
 Full details of the approach are given in the methods section of the paper.
 
@@ -58,6 +58,6 @@ The code
 
 ### Input and example output
 
-10x scRNA-seq data from Cosgrove et al can be found [here](******LINK*****) and targeted sequencing data [here](******LINK*****). Input and output for the barcode extraction and filtering parts of the code are provided for sample m534 (files have been zipped to save space but input to code should be unzipped). 
+10x scRNA-seq data and targeted sequencing data from Cosgrove et al. are available from GEO/SRA (accession codes in the article's Data Availability statement). Input and output for the barcode extraction and filtering parts of the code are provided for sample m534 (files have been zipped to save space but input to code should be unzipped). 
 
 
