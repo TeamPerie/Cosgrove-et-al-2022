@@ -1,0 +1,400 @@
+---
+title: "inflammationAnalysis"
+author: "Jason Cosgrove"
+date: "2023-09-05"
+output: html_document
+---
+
+
+Here we do a reanalysis of Fast et al. Elife paper where HSPCs are stimulated ex vivo with polyIC, GCSF, inodmethacin, and prostaglandin. 
+
+
+## Step 1: Create the workspace
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(Seurat)
+library(ggplot2)
+library(ggpubr)
+library(enrichR)
+library(org.Mm.eg.db)
+library(scran)
+library(dplyr)
+library(clustree)
+
+
+setwd("/Users/jasoncosgrove/Team_Perie Dropbox/Jason  Cosgrove/Jason/Research/Experiments/Dry_Lab/METAB/Inflamm/JCB28_LPStranscriptomics/Fast_etal")
+
+
+```
+
+
+## Step 2: Define helper methods
+
+Define methods that we will use in our analysis
+
+```{r helper methods, echo=FALSE}
+
+
+plotCellCycleResults <- function(dataset.integrated){
+  df <- (table( dataset.integrated@meta.data$orig.ident,dataset.integrated@meta.data$phases))
+  
+  par(mfrow=c(2,1))
+  barplot(t(t(df) /colSums(df)),legend = FALSE, col = c("cornflowerblue", "darkolivegreen3","orange","red"))
+  barplot(df,legend = TRUE, beside = TRUE,col = c("cornflowerblue", "darkolivegreen3","orange","red"))
+
+}
+
+CreateSeuratObjects <- function(ctrl,indo,pIC,GCSF){
+  m1.sobj <- CreateSeuratObject(counts = ctrl, min.cells = 50, min.features = 300,project = "ctrl")
+  
+  m2.sobj <- CreateSeuratObject(counts = indo, min.cells = 50, min.features = 300,project = "indo")
+  
+  m3.sobj <- CreateSeuratObject(counts = pIC, min.cells = 50, min.features = 300,project = "pIC")
+  
+  m4.sobj <- CreateSeuratObject(counts = GCSF, min.cells = 50, min.features = 300,project = "GCSF")
+  
+
+  dataset.list <- c(m1.sobj, m2.sobj,  m3.sobj, m4.sobj)
+  return(dataset.list)
+  
+}
+
+
+createDensityPlot <- function(sobj,bins = 10){
+  
+  tmp.all<-as.data.frame(Embeddings(object = sobj, reduction = "umap"))
+  p <- ggplot(tmp.all, aes(x = UMAP_1, y = UMAP_2)) + geom_point(colour="#00000000") + 
+    stat_density_2d(aes(fill = stat(level)), geom = "polygon", bins=bins) + 
+    scale_fill_gradientn(colors = c("#4169E100","royalblue", "darkolivegreen3","goldenrod1","red")) +
+    theme_classic() + 
+    theme(legend.position="bottom")
+  
+  return(p)
+}
+
+geneSignatureScoring <- function(sobj,  gene.sets,gene.set.names,assay){
+  
+  for(i in 1:length(gene.set.names)){
+    genes.of.interest <- paste(gene.sets[,gene.set.names[i]])
+    genes.of.interest <- genes.of.interest[genes.of.interest != ""]
+    genes.of.interest <- intersect(genes.of.interest,rownames(sobj@assays$RNA))
+    sobj <- AddModuleScore(sobj , features = list(genes.of.interest),
+                           name = gene.set.names[i],replace = TRUE,assay = assay)
+  }
+  
+  return(sobj)
+  
+}
+
+removeUninformativeGenes <- function(dataset){
+  genes.to.remove <- c(rownames(dataset)[grepl("Gm",rownames(dataset))],
+                       rownames(dataset)[grepl("Rik",rownames(dataset))],
+                       rownames(dataset)[grepl("Rp",rownames(dataset))])
+  
+  
+  genes  <- rownames(dataset)[rownames(dataset) %ni% genes.to.remove]
+  
+  dataset <- subset(dataset, features = genes)
+  return(dataset)
+}
+
+
+
+cellCycleAnalysis <- function(dataset.integrated){
+  
+  mm.pairs <- readRDS(system.file("exdata", "mouse_cycle_markers.rds", package="scran"))
+  ensembl <- mapIds(org.Mm.eg.db, keys=rownames(dataset.integrated), keytype="SYMBOL", column="ENSEMBL")
+  assignments <- cyclone(dataset.integrated@assays$integrated@data, mm.pairs, gene.names=ensembl)
+  
+  dataset.integrated@meta.data$phases <- assignments$phases
+  dataset.integrated@meta.data$G1_score <- assignments$normalized.scores$G1
+  dataset.integrated@meta.data$S_score <- assignments$normalized.scores$S
+  dataset.integrated@meta.data$G2M_score <- assignments$normalized.scores$G2M
+  
+  return(dataset.integrated)
+  
+}
+
+
+# is X is in the vector Y
+# inputs : "X" is an object 
+#          "Y" is a vector
+# outputs: A boolean stating TRUE if X is in Y
+'%ni%' <- function(x,y)!('%in%'(x,y))
+
+
+
+makeIntegratedDataset <- function(){
+  ctrl <- Read10X(data.dir= "control/") 
+  indo <- Read10X(data.dir= "indo/") 
+  pIC <- Read10X(data.dir= "pIC/") 
+  GCSF <- Read10X(data.dir= "GCSF/") 
+  
+  #create a list of seurat objects, one for each experiment
+  dataset.list <- CreateSeuratObjects(ctrl,indo,pIC,GCSF)
+  
+  #for this specific analysis we dont care about unannotated genes, or ribosomal genes so let's filter them out
+  for (i in 1:length(dataset.list)) {
+    sobj <- dataset.list[[i]]
+    dataset.list[[i]] <- subset(x = dataset.list[[i]], subset = nCount_RNA > 500 
+                                & nCount_RNA < 50000 & nFeature_RNA > 500
+                                & nFeature_RNA < 6000 )
+    dataset.list[[i]] <- removeUninformativeGenes(sobj)
+  }
+  
+  
+  ### normalise the data
+  
+  
+  for (i in 1:length(dataset.list)) {
+    dataset.list[[i]] <- NormalizeData(dataset.list[[i]], verbose = FALSE)
+    dataset.list[[i]] <- FindVariableFeatures(dataset.list[[i]], selection.method = "vst", 
+                                              nfeatures = 4000, verbose = FALSE)
+  }
+  
+  
+  ### integrate the data
+  features <- SelectIntegrationFeatures(object.list = dataset.list,
+                                        nfeatures = 4000)
+  dataset.anchors <- FindIntegrationAnchors(object.list = dataset.list,anchor.features = features, dims = 1:15)
+  dataset.integrated <- IntegrateData(anchorset = dataset.anchors, dims = 1:10)
+  DefaultAssay(dataset.integrated) <- "integrated"
+
+  
+  saveRDS(dataset.integrated, file = "sobj_integrated.rds")
+  return(dataset.integrated)
+  
+}
+
+
+```
+
+
+
+## Step 3: Load the data, create the Seurat object and integrate the data
+
+```{r integrateData}
+
+
+preprocessed.dataset.filename <- "sobj_integrated.rds"
+
+if(file.exists(preprocessed.dataset.filename)){
+  
+  dataset.integrated <- readRDS(preprocessed.dataset.filename)
+  #load(file = preprocessed.dataset.filename)
+  
+} else{
+  
+  dataset.integrated <- makeIntegratedDataset()
+}
+
+```
+
+
+## Step 4: Look at the UMI and gene counts across datasets
+
+```{r plotIntegration}
+
+VlnPlot(dataset.integrated, features = c("nFeature_RNA", "nCount_RNA"), ncol = 3)
+
+```
+
+
+## Step 5: Scale the data
+
+```{r scaleData}
+
+dataset.integrated <- ScaleData(dataset.integrated,features = rownames(dataset.integrated))
+
+```
+
+
+## Step 6: Dimensionality reduction
+
+```{r dimensionalityReduction}
+
+dataset.integrated <- RunPCA(object = dataset.integrated, verbose = FALSE,npcs = 50)
+ElbowPlot(dataset.integrated,ndims = 50)
+DimPlot(dataset.integrated, reduction = "pca", group.by = "orig.ident")
+
+
+dataset.integrated <- RunUMAP(object = dataset.integrated, dims = 1:20, verbose = FALSE,reduction = "pca")
+
+
+DimPlot(object = dataset.integrated, label = FALSE,reduction = "umap", group.by = "orig.ident",
+        pt.size = 1)
+
+DimPlot(object = dataset.integrated, label = FALSE,reduction = "umap", group.by = "orig.ident",split.by = "orig.ident",
+        pt.size = 1)
+
+```
+
+## Step 7: Density Plot
+
+```{r densityPlot}
+
+Idents(object = dataset.integrated) <- "orig.ident"
+c <- subset(dataset.integrated,idents = c("ctrl"))
+g <- subset(dataset.integrated,idents = c("GCSF"))
+i <- subset(dataset.integrated,idents = c("indo"))
+p <- subset(dataset.integrated,idents = c("pIC"))
+
+p1 <- createDensityPlot(c, bins = 50) + NoLegend()
+p2 <- createDensityPlot(g, bins = 50) + NoLegend()
+p3 <- createDensityPlot(i,bins = 50) + NoLegend()
+p4 <- createDensityPlot(p,bins = 50) + NoLegend()
+
+ggarrange(p1, p2,p3,p4,ncol = 1, nrow = 4)
+
+
+```
+
+## Step 8: Cell cycle analysis
+
+```{r cellCycleAnalysis}
+
+dataset.integrated <- cellCycleAnalysis(dataset.integrated)
+
+
+plotCellCycleResults(dataset.integrated)
+
+
+```
+
+
+```{r clusteringAnalysis}
+
+
+
+dataset.integrated <- FindNeighbors(object = dataset.integrated, 
+                                      dims = 1:20,
+                                      reduction = "pca",
+                                      verbose = FALSE,force.recalc = TRUE)
+
+
+for(i in seq(from=0.1, to=1.0, by=0.1)){
+    dataset.integrated <- FindClusters(object = dataset.integrated, 
+                                       resolution = i,verbose = F)
+  }
+
+
+
+
+clustree(dataset.integrated)
+
+
+```
+
+## Step 9: Differential expression analysis
+
+```{r differentialExpression}
+
+#markers <-  FindAllMarkers(dataset.integrated,only.pos = TRUE,
+#            test.use = "LR",logfc.threshold = 0.1,assay = 'RNA')
+
+markers <-  FindMarkers(dataset.integrated,only.pos = FALSE,
+                           ident.1 = "GCSF",ident.2 = "ctrl",
+                           test.use = "LR",logfc.threshold = 0.1,assay = 'RNA')
+
+
+x <-markers %>% group_by(cluster) %>% top_n(3, avg_log2FC)
+print(tbl_df(x), n=12)
+
+DotPlot(dataset.integrated, features = unique(x$gene))
+
+DoHeatmap(dataset.integrated,features = unique(x$gene), disp.min = -1.5, disp.max = 1.5,assay='integrated' )
+
+```
+
+## Step 10: Differential pathway analysis
+
+```{r pathwayAnalysis}
+
+
+
+
+
+DEenrichRPlot(
+  dataset.integrated,
+  ident.1 = "ctrl",
+  ident.2 = "GCSF",
+  balanced = TRUE,
+  logfc.threshold = 0.1,
+  assay = NULL,
+  max.genes = 2000,
+  test.use = "LR",
+  p.val.cutoff = 0.05,
+  cols = NULL,
+  enrich.database = c("GO_Biological_Process_2018"),
+  num.pathway = 25,
+  return.gene.list = FALSE
+)
+
+
+DEenrichRPlot(
+  dataset.integrated,
+  ident.1 = "ctrl",
+  ident.2 = "pIC",
+  balanced = TRUE,
+  logfc.threshold = 0.1,
+  assay = NULL,
+  max.genes = 2000,
+  test.use = "LR",
+  p.val.cutoff = 0.05,
+  cols = NULL,
+  enrich.database = c("GO_Biological_Process_2018"),
+  num.pathway = 25,
+  return.gene.list = FALSE
+)
+
+
+DEenrichRPlot(
+  dataset.integrated,
+  ident.1 = "GCSF",
+  ident.2 = "pIC",
+  balanced = TRUE,
+  logfc.threshold = 0.1,
+  assay = NULL,
+  max.genes = 2000,
+  test.use = "LR",
+  p.val.cutoff = 0.05,
+  cols = NULL,
+  enrich.database = c("GO_Biological_Process_2018"),
+  num.pathway = 25,
+  return.gene.list = FALSE
+)
+
+```
+
+
+## Step 11: Gene signature analysis
+
+```{r signatureAnalysis}
+
+gene.sets <- read.csv('genesets.csv')
+gene.set.names <- colnames(gene.sets)
+dataset.integrated <- geneSignatureScoring(dataset.integrated, gene.sets, gene.set.names,assay = "RNA")
+
+
+x <- VlnPlot(dataset.integrated,"Sell",assay = "RNA")
+write.csv(x$data,"/Users/jasoncosgrove/Desktop/Sell_expression_ctrl_vs_GCSF.csv")
+x <- VlnPlot(dataset.integrated,"MetaFate_Myeloid1")
+write.csv(x$data,"/Users/jasoncosgrove/Desktop/MetaFate_expression_ctrl_vs_GCSF.csv")
+
+m2 <- VlnPlot(dataset.integrated,"MPP2_Pietras1",pt.size = 0)
+m3 <- VlnPlot(dataset.integrated,"MPP3_Pietras1", pt.size = 0)
+m4 <- VlnPlot(dataset.integrated,"MPP4_Pietras1", pt.size = 0)
+h <- VlnPlot(dataset.integrated,"WilsonMolO1")
+
+write.csv(m2$data,"/Users/jasoncosgrove/Desktop/GCSF_HSC.csv")
+write.csv(m3$data,"/Users/jasoncosgrove/Desktop/GCSF_MPP2.csv")
+write.csv(m4$data,"/Users/jasoncosgrove/Desktop/GCSF_MPP3.csv")
+write.csv(h$data,"/Users/jasoncosgrove/Desktop/GCSF_MPP4.csv")
+
+
+DotPlot(dataset.integrated, features = unique(gene.sets$MetaFate_Myeloid), assay = "RNA" )
+
+
+```
